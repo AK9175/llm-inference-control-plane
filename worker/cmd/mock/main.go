@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,6 +30,7 @@ func main() {
 	cost := flag.Float64("cost-per-hour", 0.0, "cost in $/hr (0 for local workers)")
 	crash := flag.Bool("crash", false, "simulate a crash: exit without deregistering (tests dead detection)")
 	modelLoadTime := flag.Duration("model-load-time", 3*time.Second, "simulated model load time before transitioning STARTING→READY")
+	reportLoadEvery := flag.Duration("report-load-every", 10*time.Second, "how often to send load metrics to the control plane")
 	flag.Parse()
 
 	conn, err := grpc.NewClient(*cp, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -142,6 +144,29 @@ func main() {
 		setState(pb.WorkerState_READY)
 	}()
 
+	// Load reporting loop — sends ReportLoad every --report-load-every seconds.
+	// Metrics are fake but state-aware: READY workers report low load, BUSY workers
+	// report higher queue depth and latency. This gives the router real data to
+	// make least-loaded routing decisions (CP6).
+	go func() {
+		ticker := time.NewTicker(*reportLoadEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				load := fakeLoad(*id, getState(), *vram)
+				if _, err := client.ReportLoad(ctx, load); err != nil {
+					fmt.Printf("[mock-worker] load report error: %v\n", err)
+					continue
+				}
+				fmt.Printf("[mock-worker] ↑ load report   id=%s  queue=%d  rps=%.1f  latency=%.0fms  vram=%dMB\n",
+					*id, load.QueueDepth, load.RequestsPerSec, load.AvgLatencyMs, load.VramUsedBytes/1024/1024)
+			case <-stopHBChan:
+				return
+			}
+		}
+	}()
+
 	// Block until SIGINT/SIGTERM (user shutdown) or drain (Fleet Scaler scale-down).
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -159,4 +184,30 @@ func main() {
 		log.Printf("[mock-worker] deregister error (non-fatal): %v", err)
 	}
 	fmt.Println("[mock-worker] done")
+}
+
+// fakeLoad generates plausible load metrics based on the worker's current state.
+// READY → idle metrics; BUSY → higher queue and latency; anything else → zeros.
+// A real worker would measure these from its actual inference queue.
+func fakeLoad(workerID string, state pb.WorkerState, vramBytes uint64) *pb.LoadReport {
+	switch state {
+	case pb.WorkerState_READY:
+		return &pb.LoadReport{
+			WorkerId:       workerID,
+			QueueDepth:     0,
+			RequestsPerSec: rand.Float64() * 2,
+			AvgLatencyMs:   80 + rand.Float64()*40,
+			VramUsedBytes:  vramBytes * uint64(30+rand.Intn(20)) / 100,
+		}
+	case pb.WorkerState_BUSY:
+		return &pb.LoadReport{
+			WorkerId:       workerID,
+			QueueDepth:     uint32(1 + rand.Intn(8)),
+			RequestsPerSec: 5 + rand.Float64()*15,
+			AvgLatencyMs:   200 + rand.Float64()*300,
+			VramUsedBytes:  vramBytes * uint64(60+rand.Intn(30)) / 100,
+		}
+	default:
+		return &pb.LoadReport{WorkerId: workerID}
+	}
 }

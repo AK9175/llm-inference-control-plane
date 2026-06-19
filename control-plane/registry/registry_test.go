@@ -133,6 +133,39 @@ func TestHeartbeat_DrainingTerminal(t *testing.T) {
 	}
 }
 
+func TestReportLoad_StoredAndReadBack(t *testing.T) {
+	r := newTestRegistry()
+	registerWorker(t, r, "w5")
+
+	// Advance to READY so the worker is visible to the router.
+	r.Heartbeat(context.Background(), &pb.HeartbeatRequest{WorkerId: "w5", State: pb.WorkerState_READY}) //nolint:errcheck
+
+	report := &pb.LoadReport{
+		WorkerId:       "w5",
+		QueueDepth:     3,
+		RequestsPerSec: 7.5,
+		AvgLatencyMs:   120.0,
+		VramUsedBytes:  2 * 1024 * 1024 * 1024, // 2 GB
+	}
+	if _, err := r.ReportLoad(context.Background(), report); err != nil {
+		t.Fatalf("ReportLoad: %v", err)
+	}
+
+	entry, ok := r.GetWorker("w5")
+	if !ok {
+		t.Fatal("worker w5 not found")
+	}
+	if entry.Load.QueueDepth != 3 {
+		t.Errorf("QueueDepth: got %d, want 3", entry.Load.QueueDepth)
+	}
+	if entry.Load.RequestsPerSec != 7.5 {
+		t.Errorf("RequestsPerSec: got %f, want 7.5", entry.Load.RequestsPerSec)
+	}
+	if entry.Load.AvgLatencyMs != 120.0 {
+		t.Errorf("AvgLatencyMs: got %f, want 120.0", entry.Load.AvgLatencyMs)
+	}
+}
+
 func TestRequestDrain_SignaledInHeartbeatResponse(t *testing.T) {
 	r := newTestRegistry()
 	registerWorker(t, r, "w4")
