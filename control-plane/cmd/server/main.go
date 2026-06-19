@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/control-plane/api"
 	"github.com/atharva/llm-serving-platform/control-plane/registry"
 	"github.com/atharva/llm-serving-platform/control-plane/router"
 	pb "github.com/atharva/llm-serving-platform/proto"
@@ -18,8 +19,9 @@ import (
 )
 
 func main() {
-	grpcAddr := flag.String("grpc-addr", ":50051", "gRPC listen address (worker registration + heartbeat)")
-	httpAddr := flag.String("http-addr", ":8080", "HTTP listen address (inference router)")
+	grpcAddr  := flag.String("grpc-addr", ":50051", "gRPC listen address (worker registration + heartbeat)")
+	httpAddr  := flag.String("http-addr", ":8080", "HTTP listen address (inference router)")
+	adminAddr := flag.String("admin-addr", ":9090", "HTTP listen address (admin API)")
 	flag.Parse()
 
 	// Each worker gets its own deadline timer — no background sweep goroutine needed.
@@ -35,6 +37,7 @@ func main() {
 
 	fmt.Printf("[control-plane] gRPC  listening on %s  (worker registry)\n", *grpcAddr)
 	fmt.Printf("[control-plane] HTTP  listening on %s  (inference router)\n", *httpAddr)
+	fmt.Printf("[control-plane] admin listening on %s  (admin API)\n", *adminAddr)
 	fmt.Printf("[control-plane] dead timeout: %s\n", registry.DefaultDeadTimeout)
 
 	// ── HTTP router (clients send inference requests here) ───────────────────
@@ -42,6 +45,13 @@ func main() {
 	go func() {
 		if err := http.ListenAndServe(*httpAddr, rtr); err != nil {
 			log.Fatalf("HTTP router failed: %v", err)
+		}
+	}()
+
+	// ── Admin API (fleet visibility + manual control) ─────────────────────────
+	go func() {
+		if err := http.ListenAndServe(*adminAddr, api.NewAdminHandler(reg, rtr)); err != nil {
+			log.Fatalf("admin API failed: %v", err)
 		}
 	}()
 

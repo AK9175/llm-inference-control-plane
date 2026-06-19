@@ -199,6 +199,18 @@ func (r *Router) getInFlight(workerID string) int64 {
 	return c.Load()
 }
 
+// InFlightSnapshot returns a point-in-time copy of in-flight counts for all
+// workers. Used by the admin API and the Fleet Scaler to observe router state.
+func (r *Router) InFlightSnapshot() map[string]int64 {
+	r.ifMu.RLock()
+	defer r.ifMu.RUnlock()
+	out := make(map[string]int64, len(r.inFlight))
+	for id, c := range r.inFlight {
+		out[id] = c.Load()
+	}
+	return out
+}
+
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
 // proxy forwards the request to target and streams the response back.
