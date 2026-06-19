@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/atharva/llm-serving-platform/control-plane/api"
+	"github.com/atharva/llm-serving-platform/control-plane/provisioner"
 	"github.com/atharva/llm-serving-platform/control-plane/registry"
 	"github.com/atharva/llm-serving-platform/control-plane/router"
 	"github.com/atharva/llm-serving-platform/control-plane/scaler"
@@ -20,11 +21,13 @@ import (
 )
 
 func main() {
-	grpcAddr   := flag.String("grpc-addr", ":50051", "gRPC listen address (worker registration + heartbeat)")
-	httpAddr   := flag.String("http-addr", ":8080", "HTTP listen address (inference router)")
-	adminAddr  := flag.String("admin-addr", ":9090", "HTTP listen address (admin API)")
-	minHealthy := flag.Int("min-healthy", 1, "minimum healthy workers before scaler warns")
-	deadGrace  := flag.Duration("dead-grace", scaler.DefaultDeadGrace, "how long to keep a DEAD worker in registry before evicting")
+	grpcAddr    := flag.String("grpc-addr", ":50051", "gRPC listen address (worker registration + heartbeat)")
+	httpAddr    := flag.String("http-addr", ":8080", "HTTP listen address (inference router)")
+	adminAddr   := flag.String("admin-addr", ":9090", "HTTP listen address (admin API)")
+	minHealthy  := flag.Int("min-healthy", 1, "minimum healthy workers before scaler warns")
+	deadGrace   := flag.Duration("dead-grace", scaler.DefaultDeadGrace, "how long to keep a DEAD worker in registry before evicting")
+	dockerImage := flag.String("docker-image", "", "Docker image for auto-provisioning on worker death (empty = disabled)")
+	dockerCPAddr := flag.String("docker-cp-addr", "host.docker.internal:50051", "gRPC address provisioned containers use to reach the control plane")
 	flag.Parse()
 
 	// Each worker gets its own deadline timer — no background sweep goroutine needed.
@@ -59,10 +62,19 @@ func main() {
 	}()
 
 	// ── Fleet Scaler (dead worker cleanup + health monitoring) ────────────────
-	sc := scaler.New(reg,
+	scalerOpts := []scaler.Option{
 		scaler.WithMinHealthy(*minHealthy),
 		scaler.WithDeadGrace(*deadGrace),
-	)
+	}
+	if *dockerImage != "" {
+		dp := &provisioner.DockerProvisioner{
+			Image:        *dockerImage,
+			ControlPlane: *dockerCPAddr,
+		}
+		scalerOpts = append(scalerOpts, scaler.WithOnWorkerEvicted(dp.OnEvicted))
+		fmt.Printf("[control-plane] auto-provisioner: docker image=%s  cp=%s\n", *dockerImage, *dockerCPAddr)
+	}
+	sc := scaler.New(reg, scalerOpts...)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	go sc.Run(ctx)
