@@ -146,6 +146,64 @@ func TestAdminStats(t *testing.T) {
 	}
 }
 
+// ── CP13: model catalog ────────────────────────────────────────────────────────
+
+func TestAdminListModels(t *testing.T) {
+	h, reg, _ := setupAdmin(t)
+	ctx := t.Context()
+
+	// w1: llama3.2:3b only — READY
+	reg.Register(ctx, &pb.WorkerInfo{WorkerId: "w1", Address: "x:1", ModelsLoaded: []string{"llama3.2:3b"}}) //nolint:errcheck
+	reg.Heartbeat(ctx, &pb.HeartbeatRequest{WorkerId: "w1", State: pb.WorkerState_READY})                    //nolint:errcheck
+
+	// w2: llama3.2:3b + mistral:7b — READY
+	reg.Register(ctx, &pb.WorkerInfo{WorkerId: "w2", Address: "x:2", ModelsLoaded: []string{"llama3.2:3b", "mistral:7b"}}) //nolint:errcheck
+	reg.Heartbeat(ctx, &pb.HeartbeatRequest{WorkerId: "w2", State: pb.WorkerState_READY})                                   //nolint:errcheck
+
+	// w3: mistral:7b — still STARTING (not healthy)
+	reg.Register(ctx, &pb.WorkerInfo{WorkerId: "w3", Address: "x:3", ModelsLoaded: []string{"mistral:7b"}}) //nolint:errcheck
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/models", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+
+	var models []modelResp
+	if err := json.NewDecoder(rec.Body).Decode(&models); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	byModel := make(map[string]modelResp)
+	for _, m := range models {
+		byModel[m.Model] = m
+	}
+
+	llama, ok := byModel["llama3.2:3b"]
+	if !ok {
+		t.Fatal("llama3.2:3b missing from model catalog")
+	}
+	if llama.TotalWorkers != 2 {
+		t.Errorf("llama3.2:3b total_workers: got %d, want 2", llama.TotalWorkers)
+	}
+	if llama.HealthyWorkers != 2 {
+		t.Errorf("llama3.2:3b healthy_workers: got %d, want 2", llama.HealthyWorkers)
+	}
+
+	mistral, ok := byModel["mistral:7b"]
+	if !ok {
+		t.Fatal("mistral:7b missing from model catalog")
+	}
+	if mistral.TotalWorkers != 2 {
+		t.Errorf("mistral:7b total_workers: got %d, want 2", mistral.TotalWorkers)
+	}
+	if mistral.HealthyWorkers != 1 {
+		t.Errorf("mistral:7b healthy_workers: got %d, want 1 (w3 is STARTING)", mistral.HealthyWorkers)
+	}
+}
+
 func TestAdminStats_FleetCostPerHour(t *testing.T) {
 	h, reg, _ := setupAdmin(t)
 

@@ -25,6 +25,7 @@ func NewAdminHandler(reg *registry.Registry, rtr *router.Router) http.Handler {
 	mux.HandleFunc("GET /admin/workers/{id}", h.getWorker)
 	mux.HandleFunc("POST /admin/workers/{id}/drain", h.drainWorker)
 	mux.HandleFunc("GET /admin/stats", h.stats)
+	mux.HandleFunc("GET /admin/models", h.listModels)
 	return mux
 }
 
@@ -56,6 +57,13 @@ type loadResp struct {
 	RequestsPerSec float64 `json:"requests_per_sec"`
 	AvgLatencyMs   float64 `json:"avg_latency_ms"`
 	VramUsedMB     uint64  `json:"vram_used_mb"`
+}
+
+type modelResp struct {
+	Model          string `json:"model"`
+	TotalWorkers   int    `json:"total_workers"`
+	HealthyWorkers int    `json:"healthy_workers"`
+	TotalInFlight  int64  `json:"total_in_flight"`
 }
 
 type statsResp struct {
@@ -122,6 +130,34 @@ func (h *adminHandler) stats(w http.ResponseWriter, _ *http.Request) {
 		s.TotalInFlight += inFlight[e.Info.WorkerId]
 	}
 	writeJSON(w, http.StatusOK, s)
+}
+
+func (h *adminHandler) listModels(w http.ResponseWriter, _ *http.Request) {
+	stats := h.reg.ModelsServed()
+	inFlight := h.rtr.InFlightSnapshot()
+
+	// Build per-model in-flight by summing across all workers that serve it.
+	workersByModel := make(map[string][]string) // model → workerIDs
+	for _, e := range h.reg.ListWorkers() {
+		for _, m := range e.Info.ModelsLoaded {
+			workersByModel[m] = append(workersByModel[m], e.Info.WorkerId)
+		}
+	}
+
+	out := make([]modelResp, 0, len(stats))
+	for _, s := range stats {
+		var totalIF int64
+		for _, wid := range workersByModel[s.Model] {
+			totalIF += inFlight[wid]
+		}
+		out = append(out, modelResp{
+			Model:          s.Model,
+			TotalWorkers:   s.TotalWorkers,
+			HealthyWorkers: s.HealthyWorkers,
+			TotalInFlight:  totalIF,
+		})
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────

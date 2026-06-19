@@ -189,3 +189,50 @@ func TestRequestDrain_SignaledInHeartbeatResponse(t *testing.T) {
 		t.Error("expected drain=true in HeartbeatResponse, got false")
 	}
 }
+
+// ── CP13: ModelsServed ─────────────────────────────────────────────────────────
+
+func TestModelsServed_CountsHealthyAndTotal(t *testing.T) {
+	r := New(15 * time.Second)
+	ctx := context.Background()
+
+	// w1: serves llama3.2:3b — READY (healthy)
+	r.Register(ctx, &pb.WorkerInfo{WorkerId: "w1", Address: "x:1", ModelsLoaded: []string{"llama3.2:3b"}}) //nolint:errcheck
+	r.Heartbeat(ctx, &pb.HeartbeatRequest{WorkerId: "w1", State: pb.WorkerState_READY})                    //nolint:errcheck
+
+	// w2: serves llama3.2:3b + mistral:7b — READY (healthy)
+	r.Register(ctx, &pb.WorkerInfo{WorkerId: "w2", Address: "x:2", ModelsLoaded: []string{"llama3.2:3b", "mistral:7b"}}) //nolint:errcheck
+	r.Heartbeat(ctx, &pb.HeartbeatRequest{WorkerId: "w2", State: pb.WorkerState_READY})                                   //nolint:errcheck
+
+	// w3: serves mistral:7b — stays STARTING (not healthy)
+	r.Register(ctx, &pb.WorkerInfo{WorkerId: "w3", Address: "x:3", ModelsLoaded: []string{"mistral:7b"}}) //nolint:errcheck
+
+	stats := r.ModelsServed()
+	byModel := make(map[string]ModelStat)
+	for _, s := range stats {
+		byModel[s.Model] = s
+	}
+
+	llama := byModel["llama3.2:3b"]
+	if llama.TotalWorkers != 2 {
+		t.Errorf("llama3.2:3b total_workers: got %d, want 2", llama.TotalWorkers)
+	}
+	if llama.HealthyWorkers != 2 {
+		t.Errorf("llama3.2:3b healthy_workers: got %d, want 2", llama.HealthyWorkers)
+	}
+
+	mistral := byModel["mistral:7b"]
+	if mistral.TotalWorkers != 2 {
+		t.Errorf("mistral:7b total_workers: got %d, want 2", mistral.TotalWorkers)
+	}
+	if mistral.HealthyWorkers != 1 {
+		t.Errorf("mistral:7b healthy_workers: got %d, want 1 (w3 is STARTING)", mistral.HealthyWorkers)
+	}
+}
+
+func TestModelsServed_EmptyRegistry(t *testing.T) {
+	r := New(15 * time.Second)
+	if got := r.ModelsServed(); len(got) != 0 {
+		t.Errorf("expected empty slice, got %v", got)
+	}
+}

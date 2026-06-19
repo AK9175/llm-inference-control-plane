@@ -324,3 +324,45 @@ func (r *Registry) WorkerCount() (total, healthy int) {
 	}
 	return
 }
+
+// ModelStat holds fleet-wide statistics for one model.
+type ModelStat struct {
+	Model          string
+	TotalWorkers   int // all workers with this model loaded (any state)
+	HealthyWorkers int // READY or BUSY workers
+}
+
+// ModelsServed returns one ModelStat per distinct model across all workers.
+// Used by the admin model catalog and the scaler model-health check.
+func (r *Registry) ModelsServed() []ModelStat {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	type counts struct{ total, healthy int }
+	m := make(map[string]*counts)
+
+	for _, e := range r.workers {
+		healthy := e.State == pb.WorkerState_READY || e.State == pb.WorkerState_BUSY
+		for _, model := range e.Info.ModelsLoaded {
+			c, ok := m[model]
+			if !ok {
+				c = &counts{}
+				m[model] = c
+			}
+			c.total++
+			if healthy {
+				c.healthy++
+			}
+		}
+	}
+
+	out := make([]ModelStat, 0, len(m))
+	for model, c := range m {
+		out = append(out, ModelStat{
+			Model:          model,
+			TotalWorkers:   c.total,
+			HealthyWorkers: c.healthy,
+		})
+	}
+	return out
+}

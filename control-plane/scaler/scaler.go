@@ -98,6 +98,15 @@ func (s *Scaler) Sweep() {
 		fmt.Printf("[scaler] ⚠  fleet below minimum: %d healthy, want %d — scale-up needed\n",
 			currentHealthy, s.minHealthy)
 	}
+
+	// Warn for any model that has lost all healthy workers — requests for that
+	// model will 503 until a new worker registers.
+	for _, ms := range s.reg.ModelsServed() {
+		if ms.HealthyWorkers == 0 {
+			fmt.Printf("[scaler] ⚠  model has no healthy workers: model=%s total_workers=%d\n",
+				ms.Model, ms.TotalWorkers)
+		}
+	}
 }
 
 func (s *Scaler) handleDead(w registry.WorkerEntry) {
