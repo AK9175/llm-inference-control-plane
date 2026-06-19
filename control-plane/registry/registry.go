@@ -35,6 +35,11 @@ type WorkerEntry struct {
 	// worker to stop accepting new requests and call Deregister() when idle.
 	DrainRequested bool
 
+	// MarkedDeadAt is the time this worker was transitioned to DEAD state.
+	// Zero until markDead() fires. The scaler uses this to enforce a grace
+	// period before evicting the entry from the registry.
+	MarkedDeadAt time.Time
+
 	// deadlineTimer fires deadTimeout after the last heartbeat.
 	// It is reset on every Heartbeat() call and stopped on Deregister().
 	// Owned by the registry — not exposed outside.
@@ -224,6 +229,7 @@ func (r *Registry) markDead(workerID string) {
 	}
 
 	entry.State = pb.WorkerState_DEAD
+	entry.MarkedDeadAt = time.Now()
 	fmt.Printf("[registry] ✗ timed out   id=%-20s silent_for=%.1fs → DEAD\n",
 		workerID, time.Since(entry.LastHeartbeat).Seconds())
 }
@@ -286,6 +292,23 @@ func (r *Registry) RequestDrain(workerID string) error {
 	}
 	entry.DrainRequested = true
 	fmt.Printf("[registry] ⇣ drain queued  id=%s\n", workerID)
+	return nil
+}
+
+// Evict forcefully removes a worker entry from the registry.
+// Used by the Fleet Scaler to clean up DEAD workers after the grace period.
+// Unlike Deregister (called by the worker itself), Evict is called by the
+// control plane when the worker is already gone and cannot deregister itself.
+func (r *Registry) Evict(workerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.workers[workerID]
+	if !ok {
+		return fmt.Errorf("worker %s not found", workerID)
+	}
+	entry.deadlineTimer.Stop()
+	delete(r.workers, workerID)
+	fmt.Printf("[registry] ✗ evicted     id=%s\n", workerID)
 	return nil
 }
 

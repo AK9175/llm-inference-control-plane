@@ -1,12 +1,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -14,14 +14,17 @@ import (
 	"github.com/atharva/llm-serving-platform/control-plane/api"
 	"github.com/atharva/llm-serving-platform/control-plane/registry"
 	"github.com/atharva/llm-serving-platform/control-plane/router"
+	"github.com/atharva/llm-serving-platform/control-plane/scaler"
 	pb "github.com/atharva/llm-serving-platform/proto"
 	"google.golang.org/grpc"
 )
 
 func main() {
-	grpcAddr  := flag.String("grpc-addr", ":50051", "gRPC listen address (worker registration + heartbeat)")
-	httpAddr  := flag.String("http-addr", ":8080", "HTTP listen address (inference router)")
-	adminAddr := flag.String("admin-addr", ":9090", "HTTP listen address (admin API)")
+	grpcAddr   := flag.String("grpc-addr", ":50051", "gRPC listen address (worker registration + heartbeat)")
+	httpAddr   := flag.String("http-addr", ":8080", "HTTP listen address (inference router)")
+	adminAddr  := flag.String("admin-addr", ":9090", "HTTP listen address (admin API)")
+	minHealthy := flag.Int("min-healthy", 1, "minimum healthy workers before scaler warns")
+	deadGrace  := flag.Duration("dead-grace", scaler.DefaultDeadGrace, "how long to keep a DEAD worker in registry before evicting")
 	flag.Parse()
 
 	// Each worker gets its own deadline timer — no background sweep goroutine needed.
@@ -55,6 +58,15 @@ func main() {
 		}
 	}()
 
+	// ── Fleet Scaler (dead worker cleanup + health monitoring) ────────────────
+	sc := scaler.New(reg,
+		scaler.WithMinHealthy(*minHealthy),
+		scaler.WithDeadGrace(*deadGrace),
+	)
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	go sc.Run(ctx)
+
 	// Fleet status printer — every 15s shows all workers and their load.
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
@@ -74,11 +86,9 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown on SIGINT / SIGTERM.
+	// Graceful shutdown — ctx is already wired to SIGINT/SIGTERM above.
 	go func() {
-		quit := make(chan os.Signal, 1)
-		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-		<-quit
+		<-ctx.Done()
 		fmt.Println("[control-plane] shutting down...")
 		grpcSrv.GracefulStop()
 	}()
