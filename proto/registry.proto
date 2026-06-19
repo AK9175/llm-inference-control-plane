@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package registry;
+
+option go_package = "github.com/atharva/llm-serving-platform/proto";
+
+// WorkerRegistry is the gRPC service the control plane exposes.
+// Workers call these RPCs to join the fleet, stay alive, and report load.
+service WorkerRegistry {
+  rpc Register   (WorkerInfo)        returns (RegisterResponse);
+  rpc Heartbeat  (HeartbeatRequest)  returns (HeartbeatResponse);
+  rpc Deregister (DeregisterRequest) returns (Empty);
+  rpc ReportLoad (LoadReport)        returns (Empty);
+}
+
+// WorkerState is the lifecycle state of a worker as seen by the control plane.
+enum WorkerState {
+  STARTING  = 0; // container up, model loading — router does not route here
+  READY     = 1; // model loaded, queue empty
+  BUSY      = 2; // processing requests, queue depth > 0
+  DRAINING  = 3; // scaler scaling down — no new requests, waiting for in-flight
+  DEAD      = 4; // missed heartbeats or deregistered
+}
+
+// WorkerInfo is sent on registration.
+// It tells the control plane everything it needs to route and cost-aware dispatch.
+message WorkerInfo {
+  string worker_id     = 1; // stable unique ID (e.g. pod name)
+  string address       = 2; // host:port the worker listens on for inference requests
+  string gpu_type      = 3; // e.g. "Apple M2", "NVIDIA L4", "NVIDIA A100"
+  uint64 vram_bytes    = 4; // total VRAM in bytes (0 for CPU-only workers)
+  repeated string models_loaded = 5; // model IDs loaded, e.g. "llama3.2:3b"
+
+  // Provider-agnostic metadata — control plane uses these for routing decisions,
+  // never for provisioning logic (that lives in WorkerProvisioner).
+  string backend       = 6; // "ollama" | "vllm" | "llama.cpp" | "jetstream"
+  string provider      = 7; // "local" | "gcp" | "aws" | "azure" | "on_prem"
+  string hardware      = 8; // "apple_m2" | "nvidia_l4" | "nvidia_a100" | "amd_mi300" | "cpu"
+  double cost_per_hour = 9; // 0.0 for local workers; actual $/hr for cloud workers
+}
+
+message RegisterResponse {
+  bool   ok             = 1;
+  string message        = 2;
+  uint32 heartbeat_interval_secs = 3; // control plane tells worker how often to heartbeat
+}
+
+// HeartbeatRequest is sent every heartbeat_interval_secs by the worker.
+message HeartbeatRequest {
+  string worker_id = 1;
+  WorkerState state = 2; // worker self-reports its current state
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+  // If drain = true, the control plane wants this worker to begin draining.
+  // Worker stops accepting new requests, finishes in-flight, then deregisters.
+  bool drain = 2;
+}
+
+// LoadReport is sent alongside or after each heartbeat with current metrics.
+message LoadReport {
+  string worker_id        = 1;
+  uint32 queue_depth      = 2; // number of requests currently queued or in-flight
+  double requests_per_sec = 3; // smoothed request rate over last 10 seconds
+  double avg_latency_ms   = 4; // smoothed avg latency over last 10 seconds
+  uint64 vram_used_bytes  = 5; // current VRAM usage
+}
+
+message DeregisterRequest {
+  string worker_id = 1;
+}
+
+message Empty {}

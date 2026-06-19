@@ -1,0 +1,39 @@
+# Binaries (root-level built artifacts only)
+/server
+/mock
+/worker-bin
+/control-plane-server
+
+# Go build cache
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go module files
+go.mod
+go.sum
+
+# Go module cache
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark results (large CSVs/plots — committed separately when ready)
+bench/results/*.csv
+bench/results/*.png
+
+# Deployment secrets
+deploy/secrets/
+*.env
