@@ -59,12 +59,13 @@ type loadResp struct {
 }
 
 type statsResp struct {
-	Total         int   `json:"total"`
-	Healthy       int   `json:"healthy"`
-	Starting      int   `json:"starting"`
-	Draining      int   `json:"draining"`
-	Dead          int   `json:"dead"`
-	TotalInFlight int64 `json:"total_in_flight"`
+	Total              int     `json:"total"`
+	Healthy            int     `json:"healthy"`
+	Starting           int     `json:"starting"`
+	Draining           int     `json:"draining"`
+	Dead               int     `json:"dead"`
+	TotalInFlight      int64   `json:"total_in_flight"`
+	FleetCostPerHour   float64 `json:"fleet_cost_per_hour"` // sum of all healthy workers' $/hr
 }
 
 // ── Handlers ───────────────────────────────────────────────────────────────────
@@ -110,6 +111,7 @@ func (h *adminHandler) stats(w http.ResponseWriter, _ *http.Request) {
 		switch e.State {
 		case pb.WorkerState_READY, pb.WorkerState_BUSY:
 			s.Healthy++
+			s.FleetCostPerHour += e.Info.CostPerHour
 		case pb.WorkerState_STARTING:
 			s.Starting++
 		case pb.WorkerState_DRAINING:

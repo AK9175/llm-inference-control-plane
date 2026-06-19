@@ -134,10 +134,11 @@ func (r *Router) handleInference(w http.ResponseWriter, req *http.Request) {
 
 // ── Worker selection ───────────────────────────────────────────────────────────
 
-// pickWorker selects the worker with the fewest in-flight requests.
-// Ties are broken by round-robin via the shared counter.
-// In-flight counts are exact (tracked by the router itself), so this
-// is never stale — unlike the QueueDepth field from load reports.
+// pickWorker selects the best worker using a three-level priority:
+//  1. Fewest in-flight requests — latency first, never stale.
+//  2. Lowest cost_per_hour — among equally-loaded workers, prefer cheaper.
+//     Local workers (cost=0) are always preferred over cloud workers.
+//  3. Round-robin — final tie-break for equal load and equal cost.
 func pickWorker(
 	workers []registry.WorkerEntry,
 	counter *atomic.Uint64,
@@ -147,7 +148,7 @@ func pickWorker(
 		return workers[0]
 	}
 
-	// Find the minimum in-flight count.
+	// Level 1: find minimum in-flight count.
 	minFlight := getInFlight(workers[0].Info.WorkerId)
 	for _, w := range workers[1:] {
 		if f := getInFlight(w.Info.WorkerId); f < minFlight {
@@ -155,16 +156,34 @@ func pickWorker(
 		}
 	}
 
-	// Collect all workers tied at the minimum — round-robin among them.
-	tied := make([]registry.WorkerEntry, 0, len(workers))
+	flight := make([]registry.WorkerEntry, 0, len(workers))
 	for _, w := range workers {
 		if getInFlight(w.Info.WorkerId) == minFlight {
-			tied = append(tied, w)
+			flight = append(flight, w)
+		}
+	}
+	if len(flight) == 1 {
+		return flight[0]
+	}
+
+	// Level 2: among equally-loaded workers, prefer lowest cost_per_hour.
+	minCost := flight[0].Info.CostPerHour
+	for _, w := range flight[1:] {
+		if w.Info.CostPerHour < minCost {
+			minCost = w.Info.CostPerHour
 		}
 	}
 
-	idx := counter.Add(1) % uint64(len(tied))
-	return tied[idx]
+	cheapest := make([]registry.WorkerEntry, 0, len(flight))
+	for _, w := range flight {
+		if w.Info.CostPerHour == minCost {
+			cheapest = append(cheapest, w)
+		}
+	}
+
+	// Level 3: round-robin among equally-loaded, equally-priced workers.
+	idx := counter.Add(1) % uint64(len(cheapest))
+	return cheapest[idx]
 }
 
 // ── In-flight counter helpers ─────────────────────────────────────────────────

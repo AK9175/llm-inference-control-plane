@@ -215,3 +215,53 @@ func TestPickWorker_SingleWorker_AlwaysPicked(t *testing.T) {
 		t.Errorf("got %s, want only", got.Info.WorkerId)
 	}
 }
+
+// ── CP11: cost-aware selection ─────────────────────────────────────────────────
+
+func TestPickWorker_PrefersCheaperWhenInFlightTied(t *testing.T) {
+	workers := []registry.WorkerEntry{
+		{Info: &pb.WorkerInfo{WorkerId: "cloud", CostPerHour: 3.50}, Load: &pb.LoadReport{}, State: pb.WorkerState_READY},
+		{Info: &pb.WorkerInfo{WorkerId: "local", CostPerHour: 0.00}, Load: &pb.LoadReport{}, State: pb.WorkerState_READY},
+	}
+	var c atomic.Uint64
+	// Both workers have zero in-flight — cost is the deciding factor.
+	for range 5 {
+		got := pickWorker(workers, &c, zeroFlight)
+		if got.Info.WorkerId != "local" {
+			t.Errorf("expected local (cost=0), got %s (cost=%.2f)", got.Info.WorkerId, got.Info.CostPerHour)
+		}
+	}
+}
+
+func TestPickWorker_HigherLoadOverridesCost(t *testing.T) {
+	// local is cheaper but has 10 in-flight; cloud is expensive but idle.
+	// Routing should pick cloud because latency (in-flight) takes priority over cost.
+	workers := []registry.WorkerEntry{
+		{Info: &pb.WorkerInfo{WorkerId: "local", CostPerHour: 0.00}, Load: &pb.LoadReport{}, State: pb.WorkerState_READY},
+		{Info: &pb.WorkerInfo{WorkerId: "cloud", CostPerHour: 3.50}, Load: &pb.LoadReport{}, State: pb.WorkerState_READY},
+	}
+	inFlight := map[string]int64{"local": 10, "cloud": 0}
+	getInFlight := func(id string) int64 { return inFlight[id] }
+
+	var c atomic.Uint64
+	got := pickWorker(workers, &c, getInFlight)
+	if got.Info.WorkerId != "cloud" {
+		t.Errorf("expected cloud (in-flight=0 beats cost), got %s", got.Info.WorkerId)
+	}
+}
+
+func TestPickWorker_SameCostAndInFlight_RoundRobin(t *testing.T) {
+	workers := []registry.WorkerEntry{
+		{Info: &pb.WorkerInfo{WorkerId: "w0", CostPerHour: 1.0}, Load: &pb.LoadReport{}, State: pb.WorkerState_READY},
+		{Info: &pb.WorkerInfo{WorkerId: "w1", CostPerHour: 1.0}, Load: &pb.LoadReport{}, State: pb.WorkerState_READY},
+	}
+	hits := map[string]int{}
+	var c atomic.Uint64
+	for range 10 {
+		got := pickWorker(workers, &c, zeroFlight)
+		hits[got.Info.WorkerId]++
+	}
+	if hits["w0"] == 0 || hits["w1"] == 0 {
+		t.Errorf("same cost + same in-flight should round-robin, got %v", hits)
+	}
+}

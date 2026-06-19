@@ -146,6 +146,39 @@ func TestAdminStats(t *testing.T) {
 	}
 }
 
+func TestAdminStats_FleetCostPerHour(t *testing.T) {
+	h, reg, _ := setupAdmin(t)
+
+	// Register two healthy workers with different costs.
+	ctx := t.Context()
+	reg.Register(ctx, &pb.WorkerInfo{ //nolint:errcheck
+		WorkerId: "local", Address: "localhost:9", ModelsLoaded: []string{"m"},
+		CostPerHour: 0.0,
+	})
+	reg.Heartbeat(ctx, &pb.HeartbeatRequest{WorkerId: "local", State: pb.WorkerState_READY}) //nolint:errcheck
+
+	reg.Register(ctx, &pb.WorkerInfo{ //nolint:errcheck
+		WorkerId: "cloud", Address: "localhost:10", ModelsLoaded: []string{"m"},
+		CostPerHour: 2.50,
+	})
+	reg.Heartbeat(ctx, &pb.HeartbeatRequest{WorkerId: "cloud", State: pb.WorkerState_READY}) //nolint:errcheck
+
+	req := httptest.NewRequest(http.MethodGet, "/admin/stats", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	var s statsResp
+	if err := json.NewDecoder(rec.Body).Decode(&s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s.FleetCostPerHour != 2.50 {
+		t.Errorf("fleet_cost_per_hour: got %.2f, want 2.50 (local=0 + cloud=2.50)", s.FleetCostPerHour)
+	}
+}
+
 func TestAdminListWorkers_ShowsInFlight(t *testing.T) {
 	// Slow upstream — blocks until we explicitly release it.
 	release := make(chan struct{})
