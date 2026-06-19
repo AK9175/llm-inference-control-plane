@@ -5,36 +5,47 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/atharva/llm-serving-platform/control-plane/registry"
+	"github.com/atharva/llm-serving-platform/control-plane/router"
 	pb "github.com/atharva/llm-serving-platform/proto"
 	"google.golang.org/grpc"
 )
 
 func main() {
-	addr := flag.String("addr", ":50051", "gRPC listen address")
+	grpcAddr := flag.String("grpc-addr", ":50051", "gRPC listen address (worker registration + heartbeat)")
+	httpAddr := flag.String("http-addr", ":8080", "HTTP listen address (inference router)")
 	flag.Parse()
-
-	lis, err := net.Listen("tcp", *addr)
-	if err != nil {
-		log.Fatalf("failed to listen on %s: %v", *addr, err)
-	}
 
 	// Each worker gets its own deadline timer — no background sweep goroutine needed.
 	reg := registry.New(registry.DefaultDeadTimeout)
 
-	srv := grpc.NewServer()
-	pb.RegisterWorkerRegistryServer(srv, reg)
+	// ── gRPC server (workers talk here) ──────────────────────────────────────
+	lis, err := net.Listen("tcp", *grpcAddr)
+	if err != nil {
+		log.Fatalf("failed to listen on %s: %v", *grpcAddr, err)
+	}
+	grpcSrv := grpc.NewServer()
+	pb.RegisterWorkerRegistryServer(grpcSrv, reg)
 
-	fmt.Printf("[control-plane] listening on %s\n", *addr)
-	fmt.Printf("[control-plane] dead timeout: %s (per-worker timer)\n", registry.DefaultDeadTimeout)
+	fmt.Printf("[control-plane] gRPC  listening on %s  (worker registry)\n", *grpcAddr)
+	fmt.Printf("[control-plane] HTTP  listening on %s  (inference router)\n", *httpAddr)
+	fmt.Printf("[control-plane] dead timeout: %s\n", registry.DefaultDeadTimeout)
 
-	// Fleet status printer — every 15s prints all workers and their load metrics.
-	// Gives visibility into what the router will see when picking a worker (CP6).
+	// ── HTTP router (clients send inference requests here) ───────────────────
+	rtr := router.New(reg)
+	go func() {
+		if err := http.ListenAndServe(*httpAddr, rtr); err != nil {
+			log.Fatalf("HTTP router failed: %v", err)
+		}
+	}()
+
+	// Fleet status printer — every 15s shows all workers and their load.
 	go func() {
 		ticker := time.NewTicker(15 * time.Second)
 		defer ticker.Stop()
@@ -59,10 +70,10 @@ func main() {
 		signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 		<-quit
 		fmt.Println("[control-plane] shutting down...")
-		srv.GracefulStop()
+		grpcSrv.GracefulStop()
 	}()
 
-	if err := srv.Serve(lis); err != nil {
-		log.Fatalf("server failed: %v", err)
+	if err := grpcSrv.Serve(lis); err != nil {
+		log.Fatalf("gRPC server failed: %v", err)
 	}
 }
