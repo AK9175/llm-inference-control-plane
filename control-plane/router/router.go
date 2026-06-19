@@ -6,29 +6,40 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"sync/atomic"
 
 	"github.com/atharva/llm-serving-platform/control-plane/registry"
 )
 
 // Router is an HTTP server that sits in front of the worker fleet.
-// It parses the model name from each request, finds healthy workers
-// that have that model loaded, picks one via round-robin, and proxies
-// the request to that worker's Ollama address.
 //
-// It exposes an OpenAI-compatible surface:
-//   POST /v1/chat/completions
-//   POST /v1/completions
+// Routing algorithm (CP8):
+//  1. Primary signal: in-flight request count per worker — always accurate,
+//     never stale. Tracked by the router itself, not reported by the worker.
+//  2. Tie-break: round-robin via atomic counter.
+//  3. Retry: if a worker is unreachable (connection error before response
+//     starts), the router picks the next-best worker and retries — up to
+//     min(len(workers), 3) attempts total. The client never sees a 502
+//     unless all retry attempts fail.
 //
-// so any OpenAI SDK or curl command works out of the box.
+// Exposes an OpenAI-compatible surface:
+//
+//	POST /v1/chat/completions
+//	POST /v1/completions
 type Router struct {
-	reg     *registry.Registry
-	counter atomic.Uint64
+	reg      *registry.Registry
+	counter  atomic.Uint64
+	ifMu     sync.RWMutex
+	inFlight map[string]*atomic.Int64 // workerID → in-flight count
 }
 
 // New creates a Router backed by the given registry.
 func New(reg *registry.Registry) *Router {
-	return &Router{reg: reg}
+	return &Router{
+		reg:      reg,
+		inFlight: make(map[string]*atomic.Int64),
+	}
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -49,8 +60,7 @@ func (r *Router) handleInference(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Read body once — we need to inspect it for the model name
-	// and then forward it unchanged to the worker.
+	// Read body once — inspect for model name, then forward unchanged.
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		http.Error(w, "failed to read request body", http.StatusBadRequest)
@@ -65,7 +75,6 @@ func (r *Router) handleInference(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Find workers that are READY or BUSY and have this model loaded.
 	workers := r.reg.HealthyWorkersForModel(payload.Model)
 	if len(workers) == 0 {
 		http.Error(w,
@@ -74,69 +83,135 @@ func (r *Router) handleInference(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	chosen := pickWorker(workers, &r.counter)
+	// Cap retries at 3 — no point hammering a dead fleet.
+	maxAttempts := min(len(workers), 3)
+	tried := make(map[string]bool, maxAttempts)
 
-	target := "http://" + chosen.Info.Address + req.URL.Path
-	fmt.Printf("[router] → %s  model=%s  worker=%s\n", req.URL.Path, payload.Model, chosen.Info.WorkerId)
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// Exclude workers that already failed this request.
+		candidates := make([]registry.WorkerEntry, 0, len(workers))
+		for _, w := range workers {
+			if !tried[w.Info.WorkerId] {
+				candidates = append(candidates, w)
+			}
+		}
+		if len(candidates) == 0 {
+			break
+		}
 
-	if err := r.proxy(w, req, target, body); err != nil {
-		fmt.Printf("[router] proxy error worker=%s: %v\n", chosen.Info.WorkerId, err)
-		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
+		chosen := pickWorker(candidates, &r.counter, r.getInFlight)
+		tried[chosen.Info.WorkerId] = true
+
+		target := "http://" + chosen.Info.Address + req.URL.Path
+		if attempt == 1 {
+			fmt.Printf("[router] → %s  model=%s  worker=%s\n",
+				req.URL.Path, payload.Model, chosen.Info.WorkerId)
+		} else {
+			fmt.Printf("[router] ↺ retry %d  model=%s  worker=%s\n",
+				attempt, payload.Model, chosen.Info.WorkerId)
+		}
+
+		r.inc(chosen.Info.WorkerId)
+		retryable, err := r.proxy(w, req, target, body)
+		r.dec(chosen.Info.WorkerId)
+
+		if err == nil {
+			return // success
+		}
+
+		fmt.Printf("[router] ✗ worker=%s err=%v  retryable=%v\n",
+			chosen.Info.WorkerId, err, retryable)
+
+		if !retryable {
+			// Response already started streaming — can't recover, client sees the error.
+			return
+		}
+		// Connection-level failure before any response was written — safe to retry.
 	}
+
+	http.Error(w, "all workers failed or unavailable", http.StatusBadGateway)
 }
 
-// pickWorker selects the best worker from a non-empty slice.
-//
-// Algorithm:
-//  1. If no load data has arrived yet (all queue=0, latency=0) — round-robin
-//     via the shared counter so requests spread evenly across the fleet.
-//  2. Otherwise: pick the worker with the lowest queue_depth.
-//     Tie-break on avg_latency_ms (lower is better).
-//
-// We keep round-robin as the zero-data fallback because without load reports
-// we have no basis for preference — always picking index 0 would pin all
-// traffic to one worker until the first ReportLoad arrives.
-func pickWorker(workers []registry.WorkerEntry, counter *atomic.Uint64) registry.WorkerEntry {
+// ── Worker selection ───────────────────────────────────────────────────────────
+
+// pickWorker selects the worker with the fewest in-flight requests.
+// Ties are broken by round-robin via the shared counter.
+// In-flight counts are exact (tracked by the router itself), so this
+// is never stale — unlike the QueueDepth field from load reports.
+func pickWorker(
+	workers []registry.WorkerEntry,
+	counter *atomic.Uint64,
+	getInFlight func(string) int64,
+) registry.WorkerEntry {
 	if len(workers) == 1 {
 		return workers[0]
 	}
 
-	// Check whether any worker has reported non-zero load yet.
-	hasLoad := false
-	for _, w := range workers {
-		if w.Load.QueueDepth > 0 || w.Load.AvgLatencyMs > 0 {
-			hasLoad = true
-			break
+	// Find the minimum in-flight count.
+	minFlight := getInFlight(workers[0].Info.WorkerId)
+	for _, w := range workers[1:] {
+		if f := getInFlight(w.Info.WorkerId); f < minFlight {
+			minFlight = f
 		}
-	}
-	if !hasLoad {
-		// No load data yet — round-robin.
-		idx := counter.Add(1) % uint64(len(workers))
-		return workers[idx]
 	}
 
-	// Least-loaded: single pass, primary = queue_depth, tie-break = latency.
-	best := workers[0]
-	for _, w := range workers[1:] {
-		if w.Load.QueueDepth < best.Load.QueueDepth ||
-			(w.Load.QueueDepth == best.Load.QueueDepth &&
-				w.Load.AvgLatencyMs < best.Load.AvgLatencyMs) {
-			best = w
+	// Collect all workers tied at the minimum — round-robin among them.
+	tied := make([]registry.WorkerEntry, 0, len(workers))
+	for _, w := range workers {
+		if getInFlight(w.Info.WorkerId) == minFlight {
+			tied = append(tied, w)
 		}
 	}
-	return best
+
+	idx := counter.Add(1) % uint64(len(tied))
+	return tied[idx]
 }
 
+// ── In-flight counter helpers ─────────────────────────────────────────────────
+
+func (r *Router) counter64(workerID string) *atomic.Int64 {
+	r.ifMu.RLock()
+	c, ok := r.inFlight[workerID]
+	r.ifMu.RUnlock()
+	if ok {
+		return c
+	}
+	r.ifMu.Lock()
+	defer r.ifMu.Unlock()
+	if c, ok = r.inFlight[workerID]; ok {
+		return c // another goroutine beat us
+	}
+	c = new(atomic.Int64)
+	r.inFlight[workerID] = c
+	return c
+}
+
+func (r *Router) inc(workerID string) { r.counter64(workerID).Add(1) }
+func (r *Router) dec(workerID string) { r.counter64(workerID).Add(-1) }
+
+func (r *Router) getInFlight(workerID string) int64 {
+	r.ifMu.RLock()
+	c, ok := r.inFlight[workerID]
+	r.ifMu.RUnlock()
+	if !ok {
+		return 0
+	}
+	return c.Load()
+}
+
+// ── Proxy ─────────────────────────────────────────────────────────────────────
+
 // proxy forwards the request to target and streams the response back.
-// Streaming responses (SSE / chunked) work because we use io.Copy —
-// bytes flow through as the upstream writes them.
-func (r *Router) proxy(w http.ResponseWriter, orig *http.Request, target string, body []byte) error {
+// Returns (retryable=true, err) when the upstream was unreachable before
+// any response bytes were written — the caller can safely try another worker.
+// Returns (retryable=false, err) when streaming started and then broke —
+// the response headers are already committed, so retrying is not possible.
+func (r *Router) proxy(w http.ResponseWriter, orig *http.Request, target string, body []byte) (retryable bool, _ error) {
 	proxyReq, err := http.NewRequestWithContext(orig.Context(), orig.Method, target, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("build request: %w", err)
+		return true, fmt.Errorf("build request: %w", err)
 	}
 
-	// Forward relevant headers from the original request.
 	for _, h := range []string{"Content-Type", "Accept", "Authorization"} {
 		if v := orig.Header.Get(h); v != "" {
 			proxyReq.Header.Set(h, v)
@@ -144,15 +219,26 @@ func (r *Router) proxy(w http.ResponseWriter, orig *http.Request, target string,
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
 
+	// Connection errors here are retryable — nothing written to w yet.
 	resp, err := http.DefaultClient.Do(proxyReq)
 	if err != nil {
-		return fmt.Errorf("upstream call: %w", err)
+		return true, fmt.Errorf("upstream unreachable: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Copy status + headers before writing body.
+	// Once we write the status code the response is committed — no retry possible.
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
 	w.WriteHeader(resp.StatusCode)
-	_, err = io.Copy(w, resp.Body)
-	return err
+
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		return false, fmt.Errorf("stream interrupted: %w", err)
+	}
+	return false, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
