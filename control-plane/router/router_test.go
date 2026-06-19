@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,6 +92,58 @@ func TestRouter_MissingModel_Returns400(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status: got %d, want 400", rec.Code)
+	}
+}
+
+// ── pickWorker unit tests ──────────────────────────────────────────────────────
+
+func makeWorker(id string, queue uint32, latencyMs float64) registry.WorkerEntry {
+	return registry.WorkerEntry{
+		Info:  &pb.WorkerInfo{WorkerId: id},
+		Load:  &pb.LoadReport{QueueDepth: queue, AvgLatencyMs: latencyMs},
+		State: pb.WorkerState_READY,
+	}
+}
+
+func TestPickWorker_LeastQueue(t *testing.T) {
+	workers := []registry.WorkerEntry{
+		makeWorker("w-busy", 5, 200),
+		makeWorker("w-idle", 1, 300),
+	}
+	var c atomic.Uint64
+	got := pickWorker(workers, &c)
+	if got.Info.WorkerId != "w-idle" {
+		t.Errorf("expected w-idle (queue=1), got %s", got.Info.WorkerId)
+	}
+}
+
+func TestPickWorker_LatencyTiebreak(t *testing.T) {
+	// Both queue=0 but different latencies — pick the faster one.
+	workers := []registry.WorkerEntry{
+		makeWorker("w-slow", 0, 300),
+		makeWorker("w-fast", 0, 100),
+	}
+	var c atomic.Uint64
+	got := pickWorker(workers, &c)
+	if got.Info.WorkerId != "w-fast" {
+		t.Errorf("expected w-fast (latency=100ms), got %s", got.Info.WorkerId)
+	}
+}
+
+func TestPickWorker_AllZero_RoundRobin(t *testing.T) {
+	// No load data yet — should distribute via round-robin, not always pick index 0.
+	workers := []registry.WorkerEntry{
+		makeWorker("w0", 0, 0),
+		makeWorker("w1", 0, 0),
+	}
+	hits := map[string]int{}
+	var c atomic.Uint64
+	for range 10 {
+		w := pickWorker(workers, &c)
+		hits[w.Info.WorkerId]++
+	}
+	if hits["w0"] == 0 || hits["w1"] == 0 {
+		t.Errorf("expected both workers hit under round-robin, got %v", hits)
 	}
 }
 

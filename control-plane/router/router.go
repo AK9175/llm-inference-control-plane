@@ -74,10 +74,7 @@ func (r *Router) handleInference(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Round-robin: atomic counter mod fleet size.
-	// Safe under concurrent requests — each request gets its own index.
-	idx := r.counter.Add(1) % uint64(len(workers))
-	chosen := workers[idx]
+	chosen := pickWorker(workers, &r.counter)
 
 	target := "http://" + chosen.Info.Address + req.URL.Path
 	fmt.Printf("[router] → %s  model=%s  worker=%s\n", req.URL.Path, payload.Model, chosen.Info.WorkerId)
@@ -86,6 +83,48 @@ func (r *Router) handleInference(w http.ResponseWriter, req *http.Request) {
 		fmt.Printf("[router] proxy error worker=%s: %v\n", chosen.Info.WorkerId, err)
 		http.Error(w, "upstream error: "+err.Error(), http.StatusBadGateway)
 	}
+}
+
+// pickWorker selects the best worker from a non-empty slice.
+//
+// Algorithm:
+//  1. If no load data has arrived yet (all queue=0, latency=0) — round-robin
+//     via the shared counter so requests spread evenly across the fleet.
+//  2. Otherwise: pick the worker with the lowest queue_depth.
+//     Tie-break on avg_latency_ms (lower is better).
+//
+// We keep round-robin as the zero-data fallback because without load reports
+// we have no basis for preference — always picking index 0 would pin all
+// traffic to one worker until the first ReportLoad arrives.
+func pickWorker(workers []registry.WorkerEntry, counter *atomic.Uint64) registry.WorkerEntry {
+	if len(workers) == 1 {
+		return workers[0]
+	}
+
+	// Check whether any worker has reported non-zero load yet.
+	hasLoad := false
+	for _, w := range workers {
+		if w.Load.QueueDepth > 0 || w.Load.AvgLatencyMs > 0 {
+			hasLoad = true
+			break
+		}
+	}
+	if !hasLoad {
+		// No load data yet — round-robin.
+		idx := counter.Add(1) % uint64(len(workers))
+		return workers[idx]
+	}
+
+	// Least-loaded: single pass, primary = queue_depth, tie-break = latency.
+	best := workers[0]
+	for _, w := range workers[1:] {
+		if w.Load.QueueDepth < best.Load.QueueDepth ||
+			(w.Load.QueueDepth == best.Load.QueueDepth &&
+				w.Load.AvgLatencyMs < best.Load.AvgLatencyMs) {
+			best = w
+		}
+	}
+	return best
 }
 
 // proxy forwards the request to target and streams the response back.
