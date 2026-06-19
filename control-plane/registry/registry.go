@@ -30,6 +30,11 @@ type WorkerEntry struct {
 	RegisteredAt  time.Time
 	Load          *pb.LoadReport
 
+	// DrainRequested is set by RequestDrain() (called by the Fleet Scaler).
+	// The next Heartbeat() response will carry drain=true, which tells the
+	// worker to stop accepting new requests and call Deregister() when idle.
+	DrainRequested bool
+
 	// deadlineTimer fires deadTimeout after the last heartbeat.
 	// It is reset on every Heartbeat() call and stopped on Deregister().
 	// Owned by the registry — not exposed outside.
@@ -112,14 +117,27 @@ func (r *Registry) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.H
 		return nil, status.Errorf(codes.NotFound, "worker %s not registered; re-register", req.WorkerId)
 	}
 
+	// Reject illegal state transitions — a worker can't jump from STARTING
+	// directly to BUSY, or go back from DRAINING to READY.
+	if !validTransition(entry.State, req.State) {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"invalid state transition %s → %s for worker %s",
+			entry.State, req.State, req.WorkerId)
+	}
+
 	// Reset the deadline timer — worker is alive.
 	// Stop + Reset is safe here because we hold the write lock,
 	// so markDead cannot run concurrently and mutate entry.State.
 	entry.deadlineTimer.Reset(r.deadTimeout)
 	entry.LastHeartbeat = time.Now()
-	entry.State = req.State
 
-	return &pb.HeartbeatResponse{Ok: true, Drain: false}, nil
+	if entry.State != req.State {
+		fmt.Printf("[registry] ↑ state change  id=%-20s %s → %s\n",
+			req.WorkerId, entry.State, req.State)
+		entry.State = req.State
+	}
+
+	return &pb.HeartbeatResponse{Ok: true, Drain: entry.DrainRequested}, nil
 }
 
 // Deregister removes a worker immediately (graceful shutdown path).
@@ -157,6 +175,34 @@ func (r *Registry) ReportLoad(_ context.Context, report *pb.LoadReport) (*pb.Emp
 }
 
 // ── Internal ──────────────────────────────────────────────────────────────────
+
+// validTransition returns true if a worker is allowed to move from `from` to `to`.
+//
+// The state machine:
+//
+//	STARTING → READY                (model finished loading)
+//	READY    ↔ BUSY                 (request in / request done)
+//	READY/BUSY → DRAINING           (drain signal from Fleet Scaler)
+//	Any        → DEAD               (missed heartbeats — set by markDead, not by worker)
+//
+// Same-state is always accepted (idempotent heartbeat).
+// DRAINING and DEAD are terminal: workers cannot self-recover from them.
+func validTransition(from, to pb.WorkerState) bool {
+	if from == to {
+		return true
+	}
+	switch from {
+	case pb.WorkerState_STARTING:
+		return to == pb.WorkerState_READY
+	case pb.WorkerState_READY:
+		return to == pb.WorkerState_BUSY || to == pb.WorkerState_DRAINING
+	case pb.WorkerState_BUSY:
+		return to == pb.WorkerState_READY || to == pb.WorkerState_DRAINING
+	case pb.WorkerState_DRAINING, pb.WorkerState_DEAD:
+		return false
+	}
+	return false
+}
 
 // markDead is called by each worker's deadline timer goroutine when the timer
 // fires. It marks the worker DEAD only if no heartbeat arrived after the timer
@@ -225,6 +271,22 @@ func (r *Registry) HealthyWorkersForModel(modelID string) []WorkerEntry {
 		}
 	}
 	return out
+}
+
+// RequestDrain marks a worker for draining. The next HeartbeatResponse for that
+// worker will carry drain=true, which tells the worker to stop accepting new
+// requests and call Deregister() once its in-flight queue is empty.
+// Called by the Fleet Scaler (CP11) when scaling the fleet down.
+func (r *Registry) RequestDrain(workerID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.workers[workerID]
+	if !ok {
+		return fmt.Errorf("worker %s not found", workerID)
+	}
+	entry.DrainRequested = true
+	fmt.Printf("[registry] ⇣ drain queued  id=%s\n", workerID)
+	return nil
 }
 
 // WorkerCount returns total and healthy worker counts. Used by the scaler.
