@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/atharva/llm-serving-platform/control-plane/api"
+	"github.com/atharva/llm-serving-platform/control-plane/metrics"
 	"github.com/atharva/llm-serving-platform/control-plane/provisioner"
 	"github.com/atharva/llm-serving-platform/control-plane/registry"
 	"github.com/atharva/llm-serving-platform/control-plane/router"
@@ -48,15 +49,21 @@ func main() {
 
 	// ── HTTP router (clients send inference requests here) ───────────────────
 	rtr := router.New(reg)
+
+	// ── Metrics — setup after router is created so the collector can read it.
+	// requestHook is passed back to the router so request outcomes are counted.
+	metricsHandler, requestHook := metrics.Setup(reg, rtr)
+	rtr.SetRequestHook(requestHook)
+
 	go func() {
 		if err := http.ListenAndServe(*httpAddr, rtr); err != nil {
 			log.Fatalf("HTTP router failed: %v", err)
 		}
 	}()
 
-	// ── Admin API (fleet visibility + manual control) ─────────────────────────
+	// ── Admin API (fleet visibility + manual control + /metrics) ─────────────
 	go func() {
-		if err := http.ListenAndServe(*adminAddr, api.NewAdminHandler(reg, rtr)); err != nil {
+		if err := http.ListenAndServe(*adminAddr, api.NewAdminHandler(reg, rtr, metricsHandler)); err != nil {
 			log.Fatalf("admin API failed: %v", err)
 		}
 	}()
