@@ -18,7 +18,9 @@ import (
 //	GET  /admin/workers/{id}      — single worker detail
 //	POST /admin/workers/{id}/drain — signal a worker to drain and exit
 //	GET  /admin/stats             — fleet-wide summary counts
-func NewAdminHandler(reg *registry.Registry, rtr *router.Router) http.Handler {
+//	GET  /admin/models            — per-model worker counts
+//	GET  /metrics                 — Prometheus scrape endpoint
+func NewAdminHandler(reg *registry.Registry, rtr *router.Router, metricsHandler http.Handler) http.Handler {
 	h := &adminHandler{reg: reg, rtr: rtr}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /admin/workers", h.listWorkers)
@@ -26,6 +28,7 @@ func NewAdminHandler(reg *registry.Registry, rtr *router.Router) http.Handler {
 	mux.HandleFunc("POST /admin/workers/{id}/drain", h.drainWorker)
 	mux.HandleFunc("GET /admin/stats", h.stats)
 	mux.HandleFunc("GET /admin/models", h.listModels)
+	mux.Handle("GET /metrics", metricsHandler)
 	return mux
 }
 

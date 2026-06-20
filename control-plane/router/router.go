@@ -28,18 +28,32 @@ import (
 //	POST /v1/chat/completions
 //	POST /v1/completions
 type Router struct {
-	reg      *registry.Registry
-	counter  atomic.Uint64
-	ifMu     sync.RWMutex
-	inFlight map[string]*atomic.Int64 // workerID → in-flight count
+	reg        *registry.Registry
+	counter    atomic.Uint64
+	ifMu       sync.RWMutex
+	inFlight   map[string]*atomic.Int64 // workerID → in-flight count
+	onRequest  func(model, result string) // nil-safe metrics hook
+}
+
+// RouterOption configures optional Router behaviour.
+type RouterOption func(*Router)
+
+// WithRequestHook sets a callback invoked after every routed request.
+// result is "success" or "error". Used by the metrics package.
+func WithRequestHook(fn func(model, result string)) RouterOption {
+	return func(r *Router) { r.onRequest = fn }
 }
 
 // New creates a Router backed by the given registry.
-func New(reg *registry.Registry) *Router {
-	return &Router{
+func New(reg *registry.Registry, opts ...RouterOption) *Router {
+	r := &Router{
 		reg:      reg,
 		inFlight: make(map[string]*atomic.Int64),
 	}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -116,19 +130,27 @@ func (r *Router) handleInference(w http.ResponseWriter, req *http.Request) {
 		r.dec(chosen.Info.WorkerId)
 
 		if err == nil {
-			return // success
+			if r.onRequest != nil {
+				r.onRequest(payload.Model, "success")
+			}
+			return
 		}
 
 		fmt.Printf("[router] ✗ worker=%s err=%v  retryable=%v\n",
 			chosen.Info.WorkerId, err, retryable)
 
 		if !retryable {
-			// Response already started streaming — can't recover, client sees the error.
+			if r.onRequest != nil {
+				r.onRequest(payload.Model, "error")
+			}
 			return
 		}
 		// Connection-level failure before any response was written — safe to retry.
 	}
 
+	if r.onRequest != nil {
+		r.onRequest(payload.Model, "error")
+	}
 	http.Error(w, "all workers failed or unavailable", http.StatusBadGateway)
 }
 
@@ -216,6 +238,12 @@ func (r *Router) getInFlight(workerID string) int64 {
 		return 0
 	}
 	return c.Load()
+}
+
+// SetRequestHook sets (or replaces) the metrics hook after construction.
+// Called by main after metrics.Setup() returns the hook func.
+func (r *Router) SetRequestHook(fn func(model, result string)) {
+	r.onRequest = fn
 }
 
 // InFlightSnapshot returns a point-in-time copy of in-flight counts for all

@@ -18,7 +18,7 @@ func setupAdmin(t *testing.T) (http.Handler, *registry.Registry, *router.Router)
 	t.Helper()
 	reg := registry.New(15 * time.Second)
 	rtr := router.New(reg)
-	return NewAdminHandler(reg, rtr), reg, rtr
+	return NewAdminHandler(reg, rtr, http.NotFoundHandler()), reg, rtr
 }
 
 func registerWorker(t *testing.T, reg *registry.Registry, id, model string) {
@@ -248,7 +248,7 @@ func TestAdminListWorkers_ShowsInFlight(t *testing.T) {
 
 	reg := registry.New(15 * time.Second)
 	rtr := router.New(reg)
-	h := NewAdminHandler(reg, rtr)
+	h := NewAdminHandler(reg, rtr, http.NotFoundHandler())
 
 	addr := strings.TrimPrefix(upstream.URL, "http://")
 	reg.Register(t.Context(), &pb.WorkerInfo{ //nolint:errcheck
