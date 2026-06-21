@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/request-plane/backpressure"
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
 	"github.com/atharva/llm-serving-platform/request-plane/slo"
 )
@@ -26,6 +27,12 @@ type Gateway struct {
 	// headers are simply omitted when they're not configured.
 	tracker   *slo.LatencyTracker
 	estimator *slo.Estimator
+
+	// policy is nil unless WithBackpressure is passed to New. It requires
+	// an estimator to function — without one there's no prediction to
+	// check against, so the gateway fails open (admits everything) rather
+	// than silently rejecting based on nothing.
+	policy *backpressure.Policy
 }
 
 // Option configures optional Gateway behaviour.
@@ -39,6 +46,15 @@ func WithSLO(tracker *slo.LatencyTracker, estimator *slo.Estimator) Option {
 		g.tracker = tracker
 		g.estimator = estimator
 	}
+}
+
+// WithBackpressure rejects requests up front when their predicted wait
+// exceeds the policy's threshold for their priority — instead of queuing
+// them toward a near-certain timeout. Requires WithSLO to also be set;
+// without an estimator there's nothing to check the policy against, so
+// the gateway admits everything (fails open).
+func WithBackpressure(policy *backpressure.Policy) Option {
+	return func(g *Gateway) { g.policy = policy }
 }
 
 // New creates a Gateway. waitTimeout bounds how long a request waits in the
@@ -87,10 +103,22 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 
 	// Snapshot queue depth BEFORE pushing — AheadOf must not count this
 	// request itself, so the estimate reflects what the caller is actually
-	// waiting behind.
-	var ahead int
-	if g.estimator != nil {
-		ahead = g.q.AheadOf(priority)
+	// waiting behind. Computed once and reused for both the backpressure
+	// admission decision and the X-Estimated-Wait-Ms header.
+	var estimate time.Duration
+	haveEstimate := g.estimator != nil
+	if haveEstimate {
+		ahead := g.q.AheadOf(priority)
+		estimate = g.estimator.Estimate(payload.Model, ahead)
+	}
+
+	if g.policy != nil && haveEstimate && !g.policy.Admit(priority, estimate) {
+		w.Header().Set("X-Estimated-Wait-Ms", strconv.FormatInt(estimate.Milliseconds(), 10))
+		w.Header().Set("Retry-After", strconv.Itoa(int(estimate.Seconds())+1))
+		http.Error(w, fmt.Sprintf(
+			"request rejected: estimated wait %s exceeds SLO for %s priority", estimate, priority),
+			http.StatusServiceUnavailable)
+		return
 	}
 
 	req := &queue.Request{
@@ -107,8 +135,7 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if g.estimator != nil {
-		estimate := g.estimator.Estimate(payload.Model, ahead)
+	if haveEstimate {
 		w.Header().Set("X-Estimated-Wait-Ms", strconv.FormatInt(estimate.Milliseconds(), 10))
 	}
 

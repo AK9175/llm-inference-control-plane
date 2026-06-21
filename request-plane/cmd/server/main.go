@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/request-plane/backpressure"
 	"github.com/atharva/llm-serving-platform/request-plane/dispatcher"
 	"github.com/atharva/llm-serving-platform/request-plane/gateway"
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
@@ -26,6 +27,9 @@ func main() {
 	concurrency := flag.Int("concurrency", 10, "number of dispatcher goroutines forwarding to upstream")
 	waitTimeout := flag.Duration("wait-timeout", 30*time.Second, "max time a request waits for dispatch before returning 504")
 	sloFallback := flag.Duration("slo-fallback-latency", 2*time.Second, "default latency estimate for a model with no observed history yet")
+	maxWaitHigh := flag.Duration("max-wait-high", 5*time.Second, "reject high-priority requests whose estimated wait exceeds this")
+	maxWaitNormal := flag.Duration("max-wait-normal", 15*time.Second, "reject normal-priority requests whose estimated wait exceeds this")
+	maxWaitLow := flag.Duration("max-wait-low", 60*time.Second, "reject low-priority requests whose estimated wait exceeds this")
 	flag.Parse()
 
 	q := queue.New(*queueCap)
@@ -33,7 +37,15 @@ func main() {
 
 	tracker := slo.NewLatencyTracker(*sloFallback)
 	estimator := slo.NewEstimator(tracker, *concurrency)
-	gw := gateway.New(q, *waitTimeout, gateway.WithSLO(tracker, estimator))
+	policy := backpressure.New(map[queue.Priority]time.Duration{
+		queue.PriorityHigh:   *maxWaitHigh,
+		queue.PriorityNormal: *maxWaitNormal,
+		queue.PriorityLow:    *maxWaitLow,
+	})
+	gw := gateway.New(q, *waitTimeout,
+		gateway.WithSLO(tracker, estimator),
+		gateway.WithBackpressure(policy),
+	)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

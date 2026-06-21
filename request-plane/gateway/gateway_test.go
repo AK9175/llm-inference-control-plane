@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/request-plane/backpressure"
 	"github.com/atharva/llm-serving-platform/request-plane/dispatcher"
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
 	"github.com/atharva/llm-serving-platform/request-plane/slo"
@@ -235,5 +236,116 @@ func TestGateway_HighPriorityRequest_LowerEstimateThanQueuedNormal(t *testing.T)
 	estimateMs := highRec.Header().Get("X-Estimated-Wait-Ms")
 	if estimateMs != "0" {
 		t.Errorf("high priority with nothing ahead: got estimate %sms, want 0", estimateMs)
+	}
+}
+
+// ── CP19: backpressure ───────────────────────────────────────────────────────
+
+func TestGateway_Backpressure_RejectsWhenEstimateExceedsThreshold(t *testing.T) {
+	tracker := slo.NewLatencyTracker(20 * time.Second) // deliberately slow fallback
+	estimator := slo.NewEstimator(tracker, 1)
+	policy := backpressure.New(map[queue.Priority]time.Duration{
+		queue.PriorityNormal: 5 * time.Second,
+	})
+
+	q := queue.New(4)
+	// Pre-load enough normal requests that AheadOf pushes the estimate past 5s:
+	// 1 ahead * 1 concurrency * 20s fallback = 20s estimate, well over the 5s cap.
+	q.TryPush(&queue.Request{ID: "blocker", Priority: queue.PriorityNormal, ResultCh: make(chan queue.Result, 1)})
+
+	gw := New(q, time.Second, WithSLO(tracker, estimator), WithBackpressure(policy))
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status: got %d, want 503 (estimated wait should exceed threshold)", rec.Code)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After header missing on backpressure rejection")
+	}
+}
+
+func TestGateway_Backpressure_AcceptsWhenEstimateWithinThreshold(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	tracker := slo.NewLatencyTracker(100 * time.Millisecond) // fast fallback
+	estimator := slo.NewEstimator(tracker, 4)
+	policy := backpressure.New(backpressure.DefaultThresholds())
+
+	q := queue.New(4)
+	d := dispatcher.New(q, upstream.URL, 4)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	gw := New(q, time.Second, WithSLO(tracker, estimator), WithBackpressure(policy))
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200 (fast fallback latency, nothing ahead — should be admitted)", rec.Code)
+	}
+}
+
+func TestGateway_Backpressure_WithoutEstimator_FailsOpen(t *testing.T) {
+	// Backpressure configured but SLO is not — gateway must not block
+	// admission since there's no estimate to check against.
+	policy := backpressure.New(map[queue.Priority]time.Duration{queue.PriorityNormal: time.Nanosecond})
+	q := queue.New(4)
+	gw := New(q, 50*time.Millisecond, WithBackpressure(policy)) // no WithSLO
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusServiceUnavailable {
+		t.Error("backpressure without an estimator should fail open (admit), not reject")
+	}
+}
+
+func TestGateway_Backpressure_HighPriorityStricterThreshold(t *testing.T) {
+	tracker := slo.NewLatencyTracker(8 * time.Second)
+	estimator := slo.NewEstimator(tracker, 1)
+	policy := backpressure.New(backpressure.DefaultThresholds()) // high=5s, low=60s
+
+	q := queue.New(4)
+	// Pre-load one high-priority request so a NEW request has something
+	// ahead of it — with an empty queue, AheadOf is always 0 and the
+	// estimate would be 0 regardless of latency, defeating this test.
+	q.TryPush(&queue.Request{ID: "blocker", Priority: queue.PriorityHigh, ResultCh: make(chan queue.Result, 1)})
+
+	gw := New(q, 50*time.Millisecond, WithSLO(tracker, estimator), WithBackpressure(policy))
+
+	// 1 ahead / 1 concurrency * 8s fallback latency = 8s estimate.
+	// Exceeds the high-priority 5s threshold but is fine for low's 60s.
+	highReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"m","messages":[]}`))
+	highReq.Header.Set("X-Priority", "high")
+	highRec := httptest.NewRecorder()
+	gw.ServeHTTP(highRec, highReq)
+
+	if highRec.Code != http.StatusServiceUnavailable {
+		t.Errorf("high priority: got %d, want 503 (8s estimate exceeds 5s threshold)", highRec.Code)
+	}
+
+	lowReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"m","messages":[]}`))
+	lowReq.Header.Set("X-Priority", "low")
+	lowRec := httptest.NewRecorder()
+	gw.ServeHTTP(lowRec, lowReq)
+
+	if lowRec.Code == http.StatusServiceUnavailable {
+		t.Error("low priority: 8s estimate should be within the 60s threshold, got 503")
 	}
 }
