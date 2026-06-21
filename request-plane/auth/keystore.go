@@ -46,3 +46,16 @@ func (s *KeyStore) Lookup(apiKey string) (KeyInfo, bool) {
 	info, ok := s.keys[apiKey]
 	return info, ok
 }
+
+// ListKeys returns the info for every registered key — for admin/dashboard
+// visibility. Never returns the raw API key strings themselves, only the
+// KeyID label and rate limit, since the raw key is a secret credential.
+func (s *KeyStore) ListKeys() []KeyInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]KeyInfo, 0, len(s.keys))
+	for _, info := range s.keys {
+		out = append(out, info)
+	}
+	return out
+}

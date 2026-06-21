@@ -41,6 +41,12 @@ type Gateway struct {
 	// behaviour exactly).
 	keyStore    *auth.KeyStore
 	rateLimiter *auth.RateLimiter
+
+	// onRequest is nil unless WithRequestHook is passed to New. Called once
+	// per request with the final outcome — for the admin/dashboard request
+	// counters (CP24). model is empty if the request failed before the
+	// body was parsed (auth rejection, bad method).
+	onRequest func(model string, success bool)
 }
 
 // Option configures optional Gateway behaviour.
@@ -76,6 +82,13 @@ func WithAuth(keyStore *auth.KeyStore, rateLimiter *auth.RateLimiter) Option {
 	}
 }
 
+// WithRequestHook registers fn to be called once per request with the
+// final outcome (model, success). Used by the admin package (CP24) to
+// maintain request counters for the dashboard.
+func WithRequestHook(fn func(model string, success bool)) Option {
+	return func(g *Gateway) { g.onRequest = fn }
+}
+
 // New creates a Gateway. waitTimeout bounds how long a request waits in the
 // queue (or for dispatch to complete) before the client gets a 504.
 func New(q *queue.Queue, waitTimeout time.Duration, opts ...Option) *Gateway {
@@ -99,6 +112,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
+	var outcomeModel string
+	success := false
+	if g.onRequest != nil {
+		defer func() { g.onRequest(outcomeModel, success) }()
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -139,6 +158,7 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "request body must contain a valid 'model' field", http.StatusBadRequest)
 		return
 	}
+	outcomeModel = payload.Model
 
 	priority := parsePriority(r)
 
@@ -196,6 +216,7 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, result.Err.Error(), http.StatusBadGateway)
 			return
 		}
+		success = result.StatusCode >= 200 && result.StatusCode < 300
 		if result.Streaming {
 			g.streamResponse(w, req, result)
 			return

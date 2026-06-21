@@ -60,3 +60,27 @@ func (r *RateLimiter) Allow(keyID string, requestsPerMin int) bool {
 	b.tokens--
 	return true
 }
+
+// Tokens reports the current token level and capacity for keyID's bucket,
+// for inspection (dashboards, debugging) only — it does NOT consume a
+// token or mutate bucket state, unlike Allow. tracked is false when
+// requestsPerMin <= 0 (unlimited; no bucket is ever created for that key).
+func (r *RateLimiter) Tokens(keyID string, requestsPerMin int) (tokens, capacity float64, tracked bool) {
+	if requestsPerMin <= 0 {
+		return 0, 0, false
+	}
+	capacity = float64(requestsPerMin)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	b, ok := r.buckets[keyID]
+	if !ok {
+		return capacity, capacity, true // never made a request yet — full bucket
+	}
+
+	refillPerSec := capacity / 60
+	elapsed := time.Since(b.lastRefill).Seconds()
+	current := min(capacity, b.tokens+elapsed*refillPerSec)
+	return current, capacity, true
+}

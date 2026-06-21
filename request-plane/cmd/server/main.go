@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/request-plane/admin"
 	"github.com/atharva/llm-serving-platform/request-plane/auth"
 	"github.com/atharva/llm-serving-platform/request-plane/backpressure"
 	"github.com/atharva/llm-serving-platform/request-plane/dispatcher"
@@ -25,6 +26,7 @@ import (
 
 func main() {
 	listenAddr := flag.String("addr", ":9000", "HTTP listen address for the request control plane")
+	adminAddr := flag.String("admin-addr", ":9001", "HTTP listen address for the request-plane admin/introspection API")
 	upstream := flag.String("upstream", "http://localhost:8080", "Infrastructure Control Plane router address")
 	queueCap := flag.Int("queue-capacity", 1000, "max queued requests before returning 503")
 	concurrency := flag.Int("concurrency", 10, "number of dispatcher goroutines forwarding to upstream")
@@ -51,15 +53,20 @@ func main() {
 		queue.PriorityNormal: *maxWaitNormal,
 		queue.PriorityLow:    *maxWaitLow,
 	})
+	stats := admin.NewStats()
 	gwOpts := []gateway.Option{
 		gateway.WithSLO(tracker, estimator),
 		gateway.WithBackpressure(policy),
+		gateway.WithRequestHook(stats.Hook()),
 	}
-	if keyStore := parseAPIKeys(*apiKeys); keyStore != nil {
-		gwOpts = append(gwOpts, gateway.WithAuth(keyStore, auth.NewRateLimiter()))
+	keyStore := parseAPIKeys(*apiKeys)
+	rateLimiter := auth.NewRateLimiter()
+	if keyStore != nil {
+		gwOpts = append(gwOpts, gateway.WithAuth(keyStore, rateLimiter))
 		fmt.Println("[request-plane] API key auth enabled")
 	}
 	gw := gateway.New(q, *waitTimeout, gwOpts...)
+	adminHandler := admin.NewHandler(q, stats, keyStore, rateLimiter)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -67,10 +74,19 @@ func main() {
 	go d.Run(ctx)
 
 	srv := &http.Server{Addr: *listenAddr, Handler: gw}
+	adminSrv := &http.Server{Addr: *adminAddr, Handler: adminHandler}
 	go func() {
 		<-ctx.Done()
 		fmt.Println("[request-plane] shutting down...")
-		srv.Close() //nolint:errcheck
+		srv.Close()      //nolint:errcheck
+		adminSrv.Close() //nolint:errcheck
+	}()
+
+	go func() {
+		fmt.Printf("[request-plane] admin API listening on %s\n", *adminAddr)
+		if err := adminSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("request-plane admin server failed: %v", err)
+		}
 	}()
 
 	fmt.Printf("[request-plane] listening on %s\n", *listenAddr)
