@@ -140,6 +140,23 @@ func (q *Queue) Len() int {
 // LenByPriority returns the number of queued requests in one priority lane.
 func (q *Queue) LenByPriority(p Priority) int { return len(q.lanes[p]) }
 
+// AheadOf returns how many currently-queued requests would be served before
+// a new request of priority p — every request in strictly higher-priority
+// lanes, plus everything already waiting in p's own lane. Used by the SLO
+// estimator to predict wait time at the moment a request is about to be
+// enqueued (call this before TryPush, since it doesn't include the new
+// request itself).
+func (q *Queue) AheadOf(p Priority) int {
+	n := 0
+	for _, lane := range popOrder {
+		n += len(q.lanes[lane])
+		if lane == p {
+			break
+		}
+	}
+	return n
+}
+
 // Cap returns the total capacity across all priority lanes.
 func (q *Queue) Cap() int {
 	n := 0

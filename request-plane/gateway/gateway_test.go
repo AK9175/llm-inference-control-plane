@@ -11,6 +11,7 @@ import (
 
 	"github.com/atharva/llm-serving-platform/request-plane/dispatcher"
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
+	"github.com/atharva/llm-serving-platform/request-plane/slo"
 )
 
 // liveSystem wires a queue + dispatcher + gateway against a fake upstream —
@@ -151,5 +152,88 @@ func TestGateway_HighPriorityHeader_BypassesFullNormalLane(t *testing.T) {
 
 	if rec.Code == http.StatusServiceUnavailable {
 		t.Error("high priority request got 503 — should have used the separate high-priority lane")
+	}
+}
+
+// ── CP18: SLO headers ────────────────────────────────────────────────────────
+
+func TestGateway_WithSLO_SetsEstimatedAndActualWaitHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := dispatcher.New(q, upstream.URL, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	tracker := slo.NewLatencyTracker(time.Second)
+	estimator := slo.NewEstimator(tracker, 2)
+	gw := New(q, 2*time.Second, WithSLO(tracker, estimator))
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if rec.Header().Get("X-Estimated-Wait-Ms") == "" {
+		t.Error("X-Estimated-Wait-Ms header missing")
+	}
+	if rec.Header().Get("X-Actual-Wait-Ms") == "" {
+		t.Error("X-Actual-Wait-Ms header missing")
+	}
+}
+
+func TestGateway_WithoutSLO_NoHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	gw := liveSystem(t, upstream.URL, 4, 1) // New(q, timeout) with no SLO option
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Header().Get("X-Estimated-Wait-Ms") != "" {
+		t.Error("X-Estimated-Wait-Ms should be absent when SLO is not configured")
+	}
+	if rec.Header().Get("X-Actual-Wait-Ms") != "" {
+		t.Error("X-Actual-Wait-Ms should be absent when SLO is not configured")
+	}
+}
+
+func TestGateway_HighPriorityRequest_LowerEstimateThanQueuedNormal(t *testing.T) {
+	tracker := slo.NewLatencyTracker(time.Second)
+	estimator := slo.NewEstimator(tracker, 1)
+
+	q := queue.New(10)
+	// Pre-load 3 normal-priority requests so a new high-priority request has
+	// nothing ahead of it, while a new normal-priority request would have 3.
+	for i := range 3 {
+		q.TryPush(&queue.Request{ID: fmt.Sprintf("n%d", i), Priority: queue.PriorityNormal, ResultCh: make(chan queue.Result, 1)})
+	}
+
+	highReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(`{"model":"m","messages":[]}`))
+	highReq.Header.Set("X-Priority", "high")
+	highRec := httptest.NewRecorder()
+
+	// No dispatcher running — request will time out, but we only care about
+	// the estimate header set before the wait begins.
+	gw := New(q, 20*time.Millisecond, WithSLO(tracker, estimator))
+	gw.ServeHTTP(highRec, highReq)
+
+	estimateMs := highRec.Header().Get("X-Estimated-Wait-Ms")
+	if estimateMs != "0" {
+		t.Errorf("high priority with nothing ahead: got estimate %sms, want 0", estimateMs)
 	}
 }

@@ -8,23 +8,47 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"sync/atomic"
 	"time"
 
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
+	"github.com/atharva/llm-serving-platform/request-plane/slo"
 )
 
 // Gateway is an http.Handler that enqueues requests and waits for a result.
 type Gateway struct {
-	q          *queue.Queue
+	q           *queue.Queue
 	waitTimeout time.Duration
-	idCounter  atomic.Uint64
+	idCounter   atomic.Uint64
+
+	// tracker/estimator are nil unless WithSLO is passed to New — SLO
+	// headers are simply omitted when they're not configured.
+	tracker   *slo.LatencyTracker
+	estimator *slo.Estimator
+}
+
+// Option configures optional Gateway behaviour.
+type Option func(*Gateway)
+
+// WithSLO enables the X-Estimated-Wait-Ms and X-Actual-Wait-Ms response
+// headers. tracker records observed latency per model; estimator predicts
+// wait time for new requests using that history plus current queue depth.
+func WithSLO(tracker *slo.LatencyTracker, estimator *slo.Estimator) Option {
+	return func(g *Gateway) {
+		g.tracker = tracker
+		g.estimator = estimator
+	}
 }
 
 // New creates a Gateway. waitTimeout bounds how long a request waits in the
 // queue (or for dispatch to complete) before the client gets a 504.
-func New(q *queue.Queue, waitTimeout time.Duration) *Gateway {
-	return &Gateway{q: q, waitTimeout: waitTimeout}
+func New(q *queue.Queue, waitTimeout time.Duration, opts ...Option) *Gateway {
+	g := &Gateway{q: q, waitTimeout: waitTimeout}
+	for _, o := range opts {
+		o(g)
+	}
+	return g
 }
 
 func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,11 +83,21 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	priority := parsePriority(r)
+
+	// Snapshot queue depth BEFORE pushing — AheadOf must not count this
+	// request itself, so the estimate reflects what the caller is actually
+	// waiting behind.
+	var ahead int
+	if g.estimator != nil {
+		ahead = g.q.AheadOf(priority)
+	}
+
 	req := &queue.Request{
 		ID:         fmt.Sprintf("req-%d", g.idCounter.Add(1)),
 		Body:       body,
 		Model:      payload.Model,
-		Priority:   parsePriority(r),
+		Priority:   priority,
 		EnqueuedAt: time.Now(),
 		ResultCh:   make(chan queue.Result, 1),
 	}
@@ -73,8 +107,18 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if g.estimator != nil {
+		estimate := g.estimator.Estimate(payload.Model, ahead)
+		w.Header().Set("X-Estimated-Wait-Ms", strconv.FormatInt(estimate.Milliseconds(), 10))
+	}
+
 	select {
 	case result := <-req.ResultCh:
+		actualWait := time.Since(req.EnqueuedAt)
+		if g.tracker != nil {
+			g.tracker.Record(payload.Model, actualWait)
+			w.Header().Set("X-Actual-Wait-Ms", strconv.FormatInt(actualWait.Milliseconds(), 10))
+		}
 		if result.Err != nil {
 			http.Error(w, result.Err.Error(), http.StatusBadGateway)
 			return

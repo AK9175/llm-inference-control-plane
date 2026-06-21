@@ -16,6 +16,7 @@ import (
 	"github.com/atharva/llm-serving-platform/request-plane/dispatcher"
 	"github.com/atharva/llm-serving-platform/request-plane/gateway"
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
+	"github.com/atharva/llm-serving-platform/request-plane/slo"
 )
 
 func main() {
@@ -24,11 +25,15 @@ func main() {
 	queueCap := flag.Int("queue-capacity", 1000, "max queued requests before returning 503")
 	concurrency := flag.Int("concurrency", 10, "number of dispatcher goroutines forwarding to upstream")
 	waitTimeout := flag.Duration("wait-timeout", 30*time.Second, "max time a request waits for dispatch before returning 504")
+	sloFallback := flag.Duration("slo-fallback-latency", 2*time.Second, "default latency estimate for a model with no observed history yet")
 	flag.Parse()
 
 	q := queue.New(*queueCap)
 	d := dispatcher.New(q, *upstream, *concurrency)
-	gw := gateway.New(q, *waitTimeout)
+
+	tracker := slo.NewLatencyTracker(*sloFallback)
+	estimator := slo.NewEstimator(tracker, *concurrency)
+	gw := gateway.New(q, *waitTimeout, gateway.WithSLO(tracker, estimator))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

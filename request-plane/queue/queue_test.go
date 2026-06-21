@@ -193,3 +193,31 @@ func TestQueue_ConcurrentPop_AllItemsDelivered(t *testing.T) {
 		t.Errorf("got %d distinct items, want %d", len(seen), n)
 	}
 }
+
+// ── CP18: AheadOf ────────────────────────────────────────────────────────────
+
+func TestQueue_AheadOf_CountsHigherAndOwnLaneOnly(t *testing.T) {
+	q := New(10)
+	q.TryPush(&Request{ID: "h1", Priority: PriorityHigh})
+	q.TryPush(&Request{ID: "h2", Priority: PriorityHigh})
+	q.TryPush(&Request{ID: "n1", Priority: PriorityNormal})
+	q.TryPush(&Request{ID: "l1", Priority: PriorityLow})
+	q.TryPush(&Request{ID: "l2", Priority: PriorityLow})
+
+	if got := q.AheadOf(PriorityHigh); got != 2 {
+		t.Errorf("AheadOf(High): got %d, want 2 (only the 2 high items)", got)
+	}
+	if got := q.AheadOf(PriorityNormal); got != 3 {
+		t.Errorf("AheadOf(Normal): got %d, want 3 (2 high + 1 normal)", got)
+	}
+	if got := q.AheadOf(PriorityLow); got != 5 {
+		t.Errorf("AheadOf(Low): got %d, want 5 (2 high + 1 normal + 2 low)", got)
+	}
+}
+
+func TestQueue_AheadOf_EmptyQueue(t *testing.T) {
+	q := New(10)
+	if got := q.AheadOf(PriorityNormal); got != 0 {
+		t.Errorf("got %d, want 0", got)
+	}
+}
