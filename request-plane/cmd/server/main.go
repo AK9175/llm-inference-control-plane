@@ -10,10 +10,12 @@ import (
 	"log"
 	"net/http"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/request-plane/auth"
 	"github.com/atharva/llm-serving-platform/request-plane/backpressure"
 	"github.com/atharva/llm-serving-platform/request-plane/dispatcher"
 	"github.com/atharva/llm-serving-platform/request-plane/gateway"
@@ -33,6 +35,7 @@ func main() {
 	maxWaitLow := flag.Duration("max-wait-low", 60*time.Second, "reject low-priority requests whose estimated wait exceeds this")
 	maxAttempts := flag.Int("max-attempts-per-model", 2, "retry budget for the same model before falling back")
 	fallbackMap := flag.String("fallback-map", "", `fallback chains, e.g. "llama3:70b=llama3:8b,llama3:3b;mistral:7b=llama3:3b"`)
+	apiKeys := flag.String("api-keys", "", `API keys and rate limits, e.g. "key1=600,key2=60" (requests/min, 0=unlimited); empty disables auth`)
 	flag.Parse()
 
 	q := queue.New(*queueCap)
@@ -48,10 +51,15 @@ func main() {
 		queue.PriorityNormal: *maxWaitNormal,
 		queue.PriorityLow:    *maxWaitLow,
 	})
-	gw := gateway.New(q, *waitTimeout,
+	gwOpts := []gateway.Option{
 		gateway.WithSLO(tracker, estimator),
 		gateway.WithBackpressure(policy),
-	)
+	}
+	if keyStore := parseAPIKeys(*apiKeys); keyStore != nil {
+		gwOpts = append(gwOpts, gateway.WithAuth(keyStore, auth.NewRateLimiter()))
+		fmt.Println("[request-plane] API key auth enabled")
+	}
+	gw := gateway.New(q, *waitTimeout, gwOpts...)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -90,4 +98,22 @@ func parseFallbackMap(s string) map[string][]string {
 		out[kv[0]] = strings.Split(kv[1], ",")
 	}
 	return out
+}
+
+// parseAPIKeys parses "key1=600,key2=60" into a populated KeyStore. Returns
+// nil for empty input — auth stays disabled, matching pre-CP22 behaviour.
+func parseAPIKeys(s string) *auth.KeyStore {
+	if s == "" {
+		return nil
+	}
+	store := auth.NewKeyStore()
+	for _, pair := range strings.Split(s, ",") {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 || kv[0] == "" {
+			continue
+		}
+		rpm, _ := strconv.Atoi(kv[1]) // non-numeric -> 0 -> unlimited
+		store.AddKey(kv[0], auth.KeyInfo{KeyID: kv[0], RequestsPerMin: rpm})
+	}
+	return store
 }

@@ -41,6 +41,10 @@ type Request struct {
 	Priority   Priority
 	EnqueuedAt time.Time
 
+	// KeyID identifies the authenticated API key that submitted this
+	// request (CP22). Empty when auth is not configured on the gateway.
+	KeyID string
+
 	// Stream is true when the client requested "stream": true. The
 	// dispatcher delivers a streaming response via Chunks instead of
 	// buffering the full body into a single Result.

@@ -9,9 +9,11 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/request-plane/auth"
 	"github.com/atharva/llm-serving-platform/request-plane/backpressure"
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
 	"github.com/atharva/llm-serving-platform/request-plane/slo"
@@ -33,6 +35,12 @@ type Gateway struct {
 	// check against, so the gateway fails open (admits everything) rather
 	// than silently rejecting based on nothing.
 	policy *backpressure.Policy
+
+	// keyStore/rateLimiter are nil unless WithAuth is passed to New — when
+	// nil, every request is admitted without an API key (matches pre-CP22
+	// behaviour exactly).
+	keyStore    *auth.KeyStore
+	rateLimiter *auth.RateLimiter
 }
 
 // Option configures optional Gateway behaviour.
@@ -55,6 +63,17 @@ func WithSLO(tracker *slo.LatencyTracker, estimator *slo.Estimator) Option {
 // the gateway admits everything (fails open).
 func WithBackpressure(policy *backpressure.Policy) Option {
 	return func(g *Gateway) { g.policy = policy }
+}
+
+// WithAuth requires a valid API key (Authorization: Bearer <key>) on every
+// request and enforces that key's rate limit. Missing or unrecognized keys
+// get 401; over-budget keys get 429. Checked before any other processing —
+// the cheapest possible rejection point for unauthenticated traffic.
+func WithAuth(keyStore *auth.KeyStore, rateLimiter *auth.RateLimiter) Option {
+	return func(g *Gateway) {
+		g.keyStore = keyStore
+		g.rateLimiter = rateLimiter
+	}
 }
 
 // New creates a Gateway. waitTimeout bounds how long a request waits in the
@@ -83,6 +102,27 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	var keyID string
+	if g.keyStore != nil {
+		apiKey, ok := extractAPIKey(r)
+		if !ok {
+			http.Error(w, "missing API key", http.StatusUnauthorized)
+			return
+		}
+		info, found := g.keyStore.Lookup(apiKey)
+		if !found {
+			http.Error(w, "invalid API key", http.StatusUnauthorized)
+			return
+		}
+		keyID = info.KeyID
+
+		if g.rateLimiter != nil && !g.rateLimiter.Allow(info.KeyID, info.RequestsPerMin) {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
 	}
 
 	body, err := io.ReadAll(r.Body)
@@ -128,6 +168,7 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 		Model:      payload.Model,
 		Priority:   priority,
 		Stream:     payload.Stream,
+		KeyID:      keyID,
 		EnqueuedAt: time.Now(),
 		ResultCh:   make(chan queue.Result, 1),
 	}
@@ -209,4 +250,19 @@ func parsePriority(r *http.Request) queue.Priority {
 	default:
 		return queue.PriorityNormal
 	}
+}
+
+// extractAPIKey reads the API key from "Authorization: Bearer <key>".
+// Returns ok=false if the header is missing, malformed, or the key is empty.
+func extractAPIKey(r *http.Request) (string, bool) {
+	const prefix = "Bearer "
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(header, prefix) {
+		return "", false
+	}
+	key := strings.TrimPrefix(header, prefix)
+	if key == "" {
+		return "", false
+	}
+	return key, true
 }

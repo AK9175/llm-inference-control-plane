@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atharva/llm-serving-platform/request-plane/auth"
 	"github.com/atharva/llm-serving-platform/request-plane/backpressure"
 	"github.com/atharva/llm-serving-platform/request-plane/dispatcher"
 	"github.com/atharva/llm-serving-platform/request-plane/queue"
@@ -510,5 +511,124 @@ func TestGateway_Stream_WaitTimeoutOnlyAppliesBeforeFirstByte(t *testing.T) {
 
 	if rec.Code != http.StatusGatewayTimeout {
 		t.Errorf("status: got %d, want 504 (upstream never sent its first byte in time)", rec.Code)
+	}
+}
+
+// ── CP22: auth + rate limiting ──────────────────────────────────────────────────
+
+func TestGateway_Auth_MissingKey_Returns401(t *testing.T) {
+	keyStore := auth.NewKeyStore()
+	keyStore.AddKey("valid-key", auth.KeyInfo{KeyID: "customer-a"})
+
+	q := queue.New(4)
+	gw := New(q, time.Second, WithAuth(keyStore, auth.NewRateLimiter()))
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	// No Authorization header set.
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want 401", rec.Code)
+	}
+}
+
+func TestGateway_Auth_InvalidKey_Returns401(t *testing.T) {
+	keyStore := auth.NewKeyStore()
+	keyStore.AddKey("valid-key", auth.KeyInfo{KeyID: "customer-a"})
+
+	q := queue.New(4)
+	gw := New(q, time.Second, WithAuth(keyStore, auth.NewRateLimiter()))
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want 401", rec.Code)
+	}
+}
+
+func TestGateway_Auth_ValidKey_Admitted(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	keyStore := auth.NewKeyStore()
+	keyStore.AddKey("valid-key", auth.KeyInfo{KeyID: "customer-a", RequestsPerMin: 0})
+
+	q := queue.New(4)
+	d := dispatcher.New(q, upstream.URL, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	gw := New(q, time.Second, WithAuth(keyStore, auth.NewRateLimiter()))
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer valid-key")
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200", rec.Code)
+	}
+}
+
+func TestGateway_Auth_RateLimitExceeded_Returns429(t *testing.T) {
+	keyStore := auth.NewKeyStore()
+	keyStore.AddKey("limited-key", auth.KeyInfo{KeyID: "customer-a", RequestsPerMin: 1})
+
+	q := queue.New(4)
+	// No dispatcher needed — the 2nd request should be rejected by the rate
+	// limiter before it ever reaches the queue.
+	gw := New(q, 50*time.Millisecond, WithAuth(keyStore, auth.NewRateLimiter()))
+
+	makeReq := func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			bytes.NewBufferString(`{"model":"m","messages":[]}`))
+		req.Header.Set("Authorization", "Bearer limited-key")
+		return req
+	}
+
+	rec1 := httptest.NewRecorder()
+	gw.ServeHTTP(rec1, makeReq()) // consumes the only token; will time out waiting for dispatch, that's fine
+
+	rec2 := httptest.NewRecorder()
+	gw.ServeHTTP(rec2, makeReq())
+
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Errorf("2nd request status: got %d, want 429", rec2.Code)
+	}
+	if rec2.Header().Get("Retry-After") == "" {
+		t.Error("Retry-After header missing on rate limit rejection")
+	}
+}
+
+func TestGateway_NoAuthConfigured_NoKeyRequired(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	gw := liveSystem(t, upstream.URL, 4, 1) // no WithAuth — auth disabled
+
+	body := `{"model":"m","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	// No Authorization header — must still succeed since auth isn't configured.
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status: got %d, want 200 (auth not configured, no key required)", rec.Code)
 	}
 }
