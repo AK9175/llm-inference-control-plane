@@ -390,3 +390,125 @@ func TestGateway_SetsServedModelHeader_OnFallback(t *testing.T) {
 		t.Errorf("X-Served-Model: got %q, want small", got)
 	}
 }
+
+// ── CP21: streaming ──────────────────────────────────────────────────────────
+
+func TestGateway_Stream_ForwardsChunksToClient(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for _, c := range []string{"data: a\n\n", "data: b\n\n", "data: [DONE]\n\n"} {
+			fmt.Fprint(w, c)
+			flusher.Flush()
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := dispatcher.New(q, upstream.URL, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	gw := New(q, 2*time.Second)
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type: got %q, want text/event-stream", got)
+	}
+	want := "data: a\n\ndata: b\n\ndata: [DONE]\n\n"
+	if rec.Body.String() != want {
+		t.Errorf("body: got %q, want %q", rec.Body.String(), want)
+	}
+}
+
+// TestGateway_Stream_DefaultsContentTypeWhenUpstreamOmitsIt exercises
+// streamResponse directly rather than through a real httptest.Server —
+// Go's net/http always sniffs and fills in SOME Content-Type on the wire,
+// so an end-to-end test can never observe a truly empty header. The
+// fallback logic itself is still worth covering as a unit.
+func TestGateway_Stream_DefaultsContentTypeWhenUpstreamOmitsIt(t *testing.T) {
+	q := queue.New(4)
+	gw := New(q, time.Second)
+
+	req := &queue.Request{ID: "r1", Chunks: make(chan []byte, 1)}
+	close(req.Chunks)
+
+	rec := httptest.NewRecorder()
+	gw.streamResponse(rec, req, queue.Result{StatusCode: http.StatusOK, ContentType: ""})
+
+	if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type: got %q, want text/event-stream (default when upstream sends none)", got)
+	}
+}
+
+func TestGateway_Stream_ServedModelHeaderOnFallback(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var parsed struct{ Model string }
+		json.Unmarshal(body, &parsed) //nolint:errcheck
+		if parsed.Model == "big" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, "data: ok\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := dispatcher.New(q, upstream.URL, 1,
+		dispatcher.WithFallbacks(map[string][]string{"big": {"small"}}),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	gw := New(q, 2*time.Second)
+
+	body := `{"model":"big","stream":true,"messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("X-Served-Model"); got != "small" {
+		t.Errorf("X-Served-Model: got %q, want small", got)
+	}
+}
+
+func TestGateway_Stream_WaitTimeoutOnlyAppliesBeforeFirstByte(t *testing.T) {
+	// Upstream takes longer than waitTimeout to send its FIRST byte —
+	// must time out, since the timeout bounds time-to-first-signal.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(150 * time.Millisecond)
+		fmt.Fprint(w, "data: late\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := dispatcher.New(q, upstream.URL, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	gw := New(q, 50*time.Millisecond) // shorter than upstream's delay
+
+	body := `{"model":"m","stream":true,"messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Errorf("status: got %d, want 504 (upstream never sent its first byte in time)", rec.Code)
+	}
+}

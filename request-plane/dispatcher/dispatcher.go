@@ -10,6 +10,13 @@
 // workers for the SAME model): a same-model retry budget for transient
 // failures, and a fallback model chain for when a model has no capacity
 // at all.
+//
+// CP21 adds streaming: instead of buffering the full upstream response
+// before replying, a streaming request gets its bytes forwarded chunk by
+// chunk as they arrive. Retry/fallback only apply before any bytes are
+// read from upstream — once streaming has started, the dispatcher has
+// already committed (the gateway may have written response headers), so
+// there's no way to retry without corrupting the client's stream.
 package dispatcher
 
 import (
@@ -31,7 +38,16 @@ type Dispatcher struct {
 	q           *queue.Queue
 	upstream    string
 	concurrency int
-	client      *http.Client
+
+	// client is used for buffered (non-streaming) requests — a finite
+	// timeout is correct here since we wait for the full response anyway.
+	client *http.Client
+
+	// streamClient has no timeout: a legitimate streaming generation can
+	// run for minutes, and http.Client.Timeout bounds the ENTIRE request
+	// including body reads, which would otherwise cut a long stream off
+	// mid-generation.
+	streamClient *http.Client
 
 	// maxAttempts is how many times to retry the SAME model on a retryable
 	// failure (connection error, 502, 503) before moving to a fallback.
@@ -70,11 +86,12 @@ func WithFallbacks(fallbacks map[string][]string) Option {
 // to the upstream router at once.
 func New(q *queue.Queue, upstream string, concurrency int, opts ...Option) *Dispatcher {
 	d := &Dispatcher{
-		q:           q,
-		upstream:    upstream,
-		concurrency: concurrency,
-		client:      &http.Client{Timeout: 60 * time.Second},
-		maxAttempts: 1,
+		q:            q,
+		upstream:     upstream,
+		concurrency:  concurrency,
+		client:       &http.Client{Timeout: 60 * time.Second},
+		streamClient: &http.Client{}, // no timeout — see field doc
+		maxAttempts:  1,
 	}
 	for _, o := range opts {
 		o(d)
@@ -101,15 +118,19 @@ func (d *Dispatcher) workerLoop(ctx context.Context) {
 		if !ok {
 			return // ctx cancelled — shut down cleanly
 		}
-		d.dispatch(req)
+		if req.Stream {
+			d.dispatchStream(req)
+		} else {
+			d.dispatchBuffered(req)
+		}
 	}
 }
 
-// dispatch forwards one request to the upstream router, retrying the
-// requested model up to maxAttempts times on a retryable failure, then
+// dispatchBuffered forwards one request to the upstream router, retrying
+// the requested model up to maxAttempts times on a retryable failure, then
 // falling through the configured fallback chain. Always sends exactly one
 // Result — the gateway is waiting on this channel and must not block forever.
-func (d *Dispatcher) dispatch(req *queue.Request) {
+func (d *Dispatcher) dispatchBuffered(req *queue.Request) {
 	chain := append([]string{req.Model}, d.fallbacks[req.Model]...)
 
 	var final queue.Result
@@ -138,16 +159,14 @@ func (d *Dispatcher) dispatch(req *queue.Request) {
 	req.ResultCh <- final
 }
 
-// attempt makes one HTTP call to the upstream router. retryable is true for
-// connection failures and 502/503 responses (upstream temporarily can't
-// serve this model) — false for anything else, including success.
+// attempt makes one buffered HTTP call to the upstream router. retryable is
+// true for connection failures and 502/503 responses (upstream temporarily
+// can't serve this model) — false for anything else, including success.
 func (d *Dispatcher) attempt(body []byte, model string) (result queue.Result, retryable bool) {
-	target := d.upstream + "/v1/chat/completions"
-	httpReq, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(body))
+	httpReq, err := buildRequest(d.upstream, body)
 	if err != nil {
 		return queue.Result{Err: fmt.Errorf("build upstream request: %w", err), ServedModel: model}, false
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := d.client.Do(httpReq)
 	if err != nil {
@@ -162,6 +181,97 @@ func (d *Dispatcher) attempt(body []byte, model string) (result queue.Result, re
 
 	result = queue.Result{StatusCode: resp.StatusCode, Body: respBody, ServedModel: model}
 	return result, isRetryableStatus(resp.StatusCode)
+}
+
+// dispatchStream forwards a streaming request, retrying/falling back only
+// while no bytes have been read from upstream yet. Once a non-retryable
+// status arrives, it commits: sends a Streaming=true Result immediately
+// (so the gateway can write headers) and pumps the response body into
+// req.Chunks until upstream closes the connection or errors.
+func (d *Dispatcher) dispatchStream(req *queue.Request) {
+	defer close(req.Chunks)
+
+	chain := append([]string{req.Model}, d.fallbacks[req.Model]...)
+
+	var final queue.Result
+	for _, model := range chain {
+		body := req.Body
+		if model != req.Model {
+			rewritten, err := setModel(req.Body, model)
+			if err != nil {
+				final = queue.Result{Err: fmt.Errorf("rewrite model for fallback %q: %w", model, err)}
+				continue
+			}
+			body = rewritten
+		}
+
+		for attempt := 1; attempt <= d.maxAttempts; attempt++ {
+			httpReq, err := buildRequest(d.upstream, body)
+			if err != nil {
+				final = queue.Result{Err: fmt.Errorf("build upstream request: %w", err), ServedModel: model}
+				continue
+			}
+
+			resp, err := d.streamClient.Do(httpReq)
+			if err != nil {
+				final = queue.Result{Err: fmt.Errorf("upstream unreachable: %w", err), ServedModel: model}
+				continue
+			}
+
+			if isRetryableStatus(resp.StatusCode) {
+				respBody, _ := io.ReadAll(resp.Body)
+				resp.Body.Close() //nolint:errcheck
+				final = queue.Result{StatusCode: resp.StatusCode, Body: respBody, ServedModel: model}
+				continue
+			}
+
+			// Non-retryable — commit. The gateway is about to write
+			// headers/status from this Result; no more retries possible
+			// after this point regardless of what happens during the read.
+			req.ResultCh <- queue.Result{
+				StatusCode:  resp.StatusCode,
+				ServedModel: model,
+				ContentType: resp.Header.Get("Content-Type"),
+				Streaming:   true,
+			}
+			streamBody(req.Chunks, resp.Body)
+			resp.Body.Close() //nolint:errcheck
+			return
+		}
+	}
+	// Exhausted every model/attempt without ever committing to a stream.
+	req.ResultCh <- final
+}
+
+// streamBody copies resp.Body into chunks as data arrives, one Read() call
+// at a time. Each chunk is a fresh slice — Read may reuse buf's backing
+// array on the next call, so sending buf directly would race with the
+// reader overwriting it before the gateway consumes the chunk.
+func streamBody(chunks chan<- []byte, body io.Reader) {
+	buf := make([]byte, 4096)
+	for {
+		n, err := body.Read(buf)
+		if n > 0 {
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			chunks <- chunk
+		}
+		if err != nil {
+			return // io.EOF (normal end) or a real error — nothing more to forward either way
+		}
+	}
+}
+
+// buildRequest constructs the upstream POST request with the standard
+// Content-Type header. Shared by both the buffered and streaming paths.
+func buildRequest(upstream string, body []byte) (*http.Request, error) {
+	target := upstream + "/v1/chat/completions"
+	req, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return req, nil
 }
 
 // isRetryableStatus reports whether a non-error HTTP response code

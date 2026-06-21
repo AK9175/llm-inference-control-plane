@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -358,5 +359,171 @@ func TestDispatcher_NoFallbackConfigured_SingleModelOnly(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("no result delivered")
+	}
+}
+
+// ── CP21: streaming ──────────────────────────────────────────────────────────
+
+func TestDispatcher_Stream_DeliversChunksIncrementally(t *testing.T) {
+	chunks := []string{"data: one\n\n", "data: two\n\n", "data: [DONE]\n\n"}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		for _, c := range chunks {
+			w.Write([]byte(c)) //nolint:errcheck
+			flusher.Flush()
+			time.Sleep(20 * time.Millisecond) // simulate token generation pacing
+		}
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := New(q, upstream.URL, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	req := &queue.Request{
+		ID:       "r1",
+		Model:    "m",
+		Stream:   true,
+		Body:     []byte(`{"model":"m","stream":true,"messages":[]}`),
+		ResultCh: make(chan queue.Result, 1),
+		Chunks:   make(chan []byte, 16),
+	}
+	q.TryPush(req)
+
+	// First signal must be the Streaming=true commit marker.
+	select {
+	case result := <-req.ResultCh:
+		if !result.Streaming {
+			t.Fatal("expected Streaming=true on the commit marker")
+		}
+		if result.StatusCode != http.StatusOK {
+			t.Errorf("status: got %d, want 200", result.StatusCode)
+		}
+		if result.ContentType != "text/event-stream" {
+			t.Errorf("ContentType: got %q, want text/event-stream", result.ContentType)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no commit marker delivered")
+	}
+
+	var received []string
+	for chunk := range req.Chunks {
+		received = append(received, string(chunk))
+	}
+
+	got := strings.Join(received, "")
+	want := strings.Join(chunks, "")
+	if got != want {
+		t.Errorf("streamed bytes: got %q, want %q", got, want)
+	}
+}
+
+func TestDispatcher_Stream_RetriesBeforeFirstByte(t *testing.T) {
+	var calls atomic.Int64
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "data: ok\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := New(q, upstream.URL, 1, WithMaxAttempts(2))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	req := &queue.Request{
+		ID:       "r1",
+		Model:    "m",
+		Stream:   true,
+		Body:     []byte(`{"model":"m","stream":true,"messages":[]}`),
+		ResultCh: make(chan queue.Result, 1),
+		Chunks:   make(chan []byte, 16),
+	}
+	q.TryPush(req)
+
+	result := <-req.ResultCh
+	if !result.Streaming || result.StatusCode != http.StatusOK {
+		t.Fatalf("expected successful streaming commit after retry, got %+v", result)
+	}
+	for range req.Chunks {
+		// drain
+	}
+	if calls.Load() != 2 {
+		t.Errorf("upstream calls: got %d, want 2 (1 failure + 1 retry, both before streaming committed)", calls.Load())
+	}
+}
+
+func TestDispatcher_Stream_ChunksChannelClosedAfterStream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "data: done\n\n")
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := New(q, upstream.URL, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	req := &queue.Request{
+		ID:       "r1",
+		Model:    "m",
+		Stream:   true,
+		Body:     []byte(`{"model":"m","stream":true,"messages":[]}`),
+		ResultCh: make(chan queue.Result, 1),
+		Chunks:   make(chan []byte, 16),
+	}
+	q.TryPush(req)
+	<-req.ResultCh
+
+	done := make(chan struct{})
+	go func() {
+		for range req.Chunks {
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Chunks closed as expected.
+	case <-time.After(time.Second):
+		t.Fatal("Chunks channel never closed")
+	}
+}
+
+func TestDispatcher_NonStreamRequest_Unaffected(t *testing.T) {
+	upstream := fakeUpstream(t, http.StatusOK, `{"ok":true}`)
+
+	q := queue.New(4)
+	d := New(q, upstream.URL, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	req := &queue.Request{
+		ID:       "r1",
+		Model:    "m",
+		Stream:   false, // explicit non-streaming
+		Body:     []byte(`{"model":"m","messages":[]}`),
+		ResultCh: make(chan queue.Result, 1),
+	}
+	q.TryPush(req)
+
+	result := <-req.ResultCh
+	if result.Streaming {
+		t.Error("non-streaming request must not get Streaming=true")
+	}
+	if len(result.Body) == 0 {
+		t.Error("non-streaming request must populate Body directly")
 	}
 }

@@ -92,7 +92,8 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var payload struct {
-		Model string `json:"model"`
+		Model  string `json:"model"`
+		Stream bool   `json:"stream"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil || payload.Model == "" {
 		http.Error(w, "request body must contain a valid 'model' field", http.StatusBadRequest)
@@ -126,8 +127,12 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 		Body:       body,
 		Model:      payload.Model,
 		Priority:   priority,
+		Stream:     payload.Stream,
 		EnqueuedAt: time.Now(),
 		ResultCh:   make(chan queue.Result, 1),
+	}
+	if payload.Stream {
+		req.Chunks = make(chan []byte, 16)
 	}
 
 	if !g.q.TryPush(req) {
@@ -150,6 +155,10 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, result.Err.Error(), http.StatusBadGateway)
 			return
 		}
+		if result.Streaming {
+			g.streamResponse(w, req, result)
+			return
+		}
 		if result.ServedModel != "" {
 			w.Header().Set("X-Served-Model", result.ServedModel)
 		}
@@ -158,6 +167,33 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 		w.Write(result.Body) //nolint:errcheck
 	case <-time.After(g.waitTimeout):
 		http.Error(w, "request timed out waiting for dispatch", http.StatusGatewayTimeout)
+	}
+}
+
+// streamResponse writes headers/status once (the dispatcher has already
+// committed — no more retries possible) then forwards each chunk from
+// req.Chunks to the client, flushing immediately so bytes aren't held back
+// by Go's default response buffering. No timeout applies here: a
+// legitimate generation can take as long as it takes, only the wait for
+// the FIRST signal (above) was bounded by waitTimeout.
+func (g *Gateway) streamResponse(w http.ResponseWriter, req *queue.Request, result queue.Result) {
+	if result.ServedModel != "" {
+		w.Header().Set("X-Served-Model", result.ServedModel)
+	}
+	contentType := result.ContentType
+	if contentType == "" {
+		contentType = "text/event-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(result.StatusCode)
+
+	flusher, canFlush := w.(http.Flusher)
+	for chunk := range req.Chunks {
+		w.Write(chunk) //nolint:errcheck
+		if canFlush {
+			flusher.Flush()
+		}
 	}
 }
 

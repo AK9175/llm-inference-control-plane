@@ -41,8 +41,22 @@ type Request struct {
 	Priority   Priority
 	EnqueuedAt time.Time
 
-	// ResultCh receives exactly one Result once the dispatcher finishes.
-	// Buffered with capacity 1 so the dispatcher never blocks writing it.
+	// Stream is true when the client requested "stream": true. The
+	// dispatcher delivers a streaming response via Chunks instead of
+	// buffering the full body into a single Result.
+	Stream bool
+
+	// Chunks receives raw response bytes as they arrive from upstream,
+	// only when Stream is true and the dispatcher has committed to
+	// streaming (signalled by a Result with Streaming=true on ResultCh).
+	// The dispatcher closes this channel when the upstream body is fully
+	// read or the connection breaks. nil when Stream is false.
+	Chunks chan []byte
+
+	// ResultCh receives exactly one Result once the dispatcher finishes
+	// (or, for streaming requests, once it commits to streaming — the
+	// actual body then flows through Chunks). Buffered with capacity 1 so
+	// the dispatcher never blocks writing it.
 	ResultCh chan Result
 }
 
@@ -57,6 +71,16 @@ type Result struct {
 	// Request.Model unless the dispatcher fell back to an alternate model
 	// (CP20) after the original model's retries were exhausted.
 	ServedModel string
+
+	// Streaming is true when the response body is being delivered via
+	// Request.Chunks rather than Body — the dispatcher has already
+	// committed to this response (no more retries/fallback possible) and
+	// is mid-stream or about to start.
+	Streaming bool
+
+	// ContentType is the upstream response's Content-Type header, used by
+	// the gateway for the streaming path (e.g. "text/event-stream").
+	ContentType string
 }
 
 // popOrder defines which lane Pop checks first: highest priority to lowest.
