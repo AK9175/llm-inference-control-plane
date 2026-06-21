@@ -52,6 +52,11 @@ type Result struct {
 	StatusCode int
 	Body       []byte
 	Err        error
+
+	// ServedModel is the model that actually produced this result. Equals
+	// Request.Model unless the dispatcher fell back to an alternate model
+	// (CP20) after the original model's retries were exhausted.
+	ServedModel string
 }
 
 // popOrder defines which lane Pop checks first: highest priority to lowest.

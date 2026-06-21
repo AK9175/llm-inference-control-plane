@@ -3,7 +3,9 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -347,5 +349,44 @@ func TestGateway_Backpressure_HighPriorityStricterThreshold(t *testing.T) {
 
 	if lowRec.Code == http.StatusServiceUnavailable {
 		t.Error("low priority: 8s estimate should be within the 60s threshold, got 503")
+	}
+}
+
+// ── CP20: served-model header ────────────────────────────────────────────────
+
+func TestGateway_SetsServedModelHeader_OnFallback(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var parsed struct{ Model string }
+		json.Unmarshal(body, &parsed) //nolint:errcheck
+		if parsed.Model == "big" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+
+	q := queue.New(4)
+	d := dispatcher.New(q, upstream.URL, 1,
+		dispatcher.WithFallbacks(map[string][]string{"big": {"small"}}),
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go d.Run(ctx)
+
+	gw := New(q, time.Second)
+
+	body := `{"model":"big","messages":[]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	gw.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("X-Served-Model"); got != "small" {
+		t.Errorf("X-Served-Model: got %q, want small", got)
 	}
 }

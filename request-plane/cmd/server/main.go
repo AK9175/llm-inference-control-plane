@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -30,10 +31,15 @@ func main() {
 	maxWaitHigh := flag.Duration("max-wait-high", 5*time.Second, "reject high-priority requests whose estimated wait exceeds this")
 	maxWaitNormal := flag.Duration("max-wait-normal", 15*time.Second, "reject normal-priority requests whose estimated wait exceeds this")
 	maxWaitLow := flag.Duration("max-wait-low", 60*time.Second, "reject low-priority requests whose estimated wait exceeds this")
+	maxAttempts := flag.Int("max-attempts-per-model", 2, "retry budget for the same model before falling back")
+	fallbackMap := flag.String("fallback-map", "", `fallback chains, e.g. "llama3:70b=llama3:8b,llama3:3b;mistral:7b=llama3:3b"`)
 	flag.Parse()
 
 	q := queue.New(*queueCap)
-	d := dispatcher.New(q, *upstream, *concurrency)
+	d := dispatcher.New(q, *upstream, *concurrency,
+		dispatcher.WithMaxAttempts(*maxAttempts),
+		dispatcher.WithFallbacks(parseFallbackMap(*fallbackMap)),
+	)
 
 	tracker := slo.NewLatencyTracker(*sloFallback)
 	estimator := slo.NewEstimator(tracker, *concurrency)
@@ -66,4 +72,22 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("request-plane server failed: %v", err)
 	}
+}
+
+// parseFallbackMap parses "modelA=modelB,modelC;modelD=modelE" into
+// {"modelA": ["modelB", "modelC"], "modelD": ["modelE"]}. Empty input
+// returns an empty (non-nil) map — no fallbacks configured.
+func parseFallbackMap(s string) map[string][]string {
+	out := make(map[string][]string)
+	if s == "" {
+		return out
+	}
+	for _, pair := range strings.Split(s, ";") {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 || kv[0] == "" || kv[1] == "" {
+			continue
+		}
+		out[kv[0]] = strings.Split(kv[1], ",")
+	}
+	return out
 }

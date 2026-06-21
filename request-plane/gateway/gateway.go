@@ -150,6 +150,9 @@ func (g *Gateway) handleInference(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, result.Err.Error(), http.StatusBadGateway)
 			return
 		}
+		if result.ServedModel != "" {
+			w.Header().Set("X-Served-Model", result.ServedModel)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(result.StatusCode)
 		w.Write(result.Body) //nolint:errcheck
